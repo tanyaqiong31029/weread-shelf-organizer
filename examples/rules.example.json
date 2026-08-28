@@ -62,6 +62,9 @@
     "生活方式-健康": "12 艺术生活",
     "生活方式-旅行": "12 艺术生活"
   },
-  "min_precedent": 2,
+  "confidence": {
+    "full_match": 0.95,
+    "head_match": 0.75
+  },
   "min_confidence": 0.6
 }

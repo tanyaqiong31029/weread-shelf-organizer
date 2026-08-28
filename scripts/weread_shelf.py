@@ -17,8 +17,10 @@ weread-shelf-organizer — 微信读书书架自动整理核心脚本
 原则: 只移动「未分组」的书; 用户放入其他自定义分组的书一律跳过;
       不删除书籍、不改变私密状态; 迁移后必须核验。
 
-依赖: python3 + openpyxl(可选, 仅导出 xlsx 时需要)
-说明: 通过本机已登录的微信读书 Mac 客户端提取 vid/skey 调用其官方接口,
+依赖: 仅 Python 3 标准库
+凭据: 默认从 macOS 微信读书 Mac 客户端日志提取; 也可设环境变量
+      WEREAD_VID / WEREAD_SKEY (可选 WEREAD_V) 在任意平台使用。
+说明: 通过已登录的微信读书客户端凭据调用其官方接口,
       凭据只驻留内存, 不落盘、不回显。
 """
 import argparse
@@ -91,6 +93,19 @@ def http_json(url, payload=None, hdrs=None, timeout=30):
 
 
 def get_cred(retry=2):
+    # 路径 1: 环境变量 (适用于无 Mac 客户端的环境, 如 Linux/CI, 凭据自行提取)
+    vid, skey = os.environ.get("WEREAD_VID"), os.environ.get("WEREAD_SKEY")
+    if vid and skey:
+        cred = {"vid": vid, "skey": skey,
+                "v": os.environ.get("WEREAD_V", VER_DEFAULT), "ua": UA_DEFAULT}
+        try:
+            http_json(f"{API}/shelf/sync?userFlag=0&synckey=&teenmode=0&album=1",
+                      hdrs=headers(cred))
+            log(f"凭据有效 (环境变量, vid={vid})")
+            return cred
+        except urllib.error.HTTPError as e:
+            log(f"环境变量凭据无效(HTTP {e.code}), 回退到客户端日志提取")
+    # 路径 2: macOS 微信读书客户端日志 (自动启动客户端)
     for attempt in range(retry):
         cred = extract_cred()
         if cred:
@@ -130,17 +145,20 @@ def split_groups(shelf, group_names):
 
 # ---------------------------------------------------------------- 规则
 def load_rules(path):
-    r = json.load(open(path, encoding="utf-8"))
+    with open(path, encoding="utf-8") as f:
+        r = json.load(f)
     groups = [g["name"] for g in r["groups"]]
     assert len(groups) == len(set(groups)), "分组名重复"
     cat_map = {}
     for cat, g in r.get("category_map", {}).items():
         cat_map[cat.strip()] = g
+    conf = r.get("confidence", {})
     return {"groups": groups, "group_desc": {g["name"]: g.get("description", "")
                                              for g in r["groups"]},
             "category_map": cat_map,
-            "min_precedent": r.get("min_precedent", 2),
-            "min_confidence": r.get("min_confidence", 0.6)}
+            "match_confidence": {"full_match": float(conf.get("full_match", 0.95)),
+                                 "head_match": float(conf.get("head_match", 0.75))},
+            "min_confidence": float(r.get("min_confidence", 0.6))}
 
 
 def load_baseline(path):
@@ -154,21 +172,27 @@ def load_baseline(path):
 
 
 def classify(book, rules, stats):
-    """平台分类 → 目标分组; 置信度不足返回 None。"""
+    """平台分类 → (分组名, 依据, 置信度)。
+
+    恒返回 3 元组: 无映射时为 (None, 原因, 0.0)。
+    置信度按匹配类型取值(可在规则文件 confidence 节配置):
+      full_match=完整分类命中, head_match=主栏目命中。
+    """
     cat = str(book.get("category") or "").strip()
     if not cat:
-        return None, "无平台分类(多为导入书)"
+        return None, "无平台分类(多为导入书)", 0.0
+    conf = rules["match_confidence"]
     g = rules["category_map"].get(cat)
     if g:
-        stats[cat] += 1
-        return g, f"平台分类「{cat}」命中映射", True
+        stats[cat] = stats.get(cat, 0) + 1
+        return g, f"平台分类「{cat}」命中映射", conf["full_match"]
     # 模糊: 分类主栏目匹配 (如 "精品小说-悬疑推理" → "精品小说")
     head = cat.split("-")[0].strip()
     g = rules["category_map"].get(head)
     if g:
-        stats[cat] += 1
-        return g, f"平台分类主栏目「{head}」命中映射", True
-    return None, f"平台分类「{cat}」未配置映射"
+        stats[cat] = stats.get(cat, 0) + 1
+        return g, f"平台分类主栏目「{head}」命中映射", conf["head_match"]
+    return None, f"平台分类「{cat}」未配置映射", 0.0
 
 
 # ---------------------------------------------------------------- 子命令
@@ -223,14 +247,19 @@ def cmd_plan(args):
             moves.append({"bookId": bid, "title": b.get("title", ""), "from": from_group,
                           "to": g, "basis": "基线表格指定", "confidence": 1.0})
         else:
-            g, basis, _ = classify(b, rules, stats)
-            if g:
+            g, basis, conf = classify(b, rules, stats)
+            if g and conf >= rules["min_confidence"]:
                 moves.append({"bookId": bid, "title": b.get("title", ""), "from": from_group,
-                              "to": g, "basis": basis, "confidence": 0.9})
+                              "to": g, "basis": basis, "confidence": conf})
             else:
-                review.append({"bookId": bid, "title": b.get("title", ""),
-                               "author": b.get("author", ""), "category": b.get("category", ""),
-                               "hint": basis, "from": from_group})
+                item = {"bookId": bid, "title": b.get("title", ""),
+                        "author": b.get("author", ""), "category": b.get("category", ""),
+                        "hint": basis, "from": from_group, "confidence": conf}
+                if g:  # 有候选但低于阈值: 附带建议供复核参考
+                    item["suggest"] = g
+                    item["hint"] += (f"(候选「{g}」, 置信度 {conf} "
+                                     f"< 阈值 {rules['min_confidence']})")
+                review.append(item)
 
     plan = {"generated_at": datetime.now().isoformat(timespec="seconds"),
             "mode": "full" if args.full else "incremental",
@@ -295,18 +324,23 @@ def _do_moves(hdrs, by_group, aid):
     return moved, failed
 
 
-def _verify(hdrs, moved, group_names):
+def _verify(hdrs, expected):
+    """核验每本书落在「预期分组」(而非任意目标分组)。
+
+    expected: {bookId: 分组名}; 返回错位清单 [(bookId, 期望分组, 实际分组)]。
+    """
     time.sleep(2)
     shelf = sync_shelf(hdrs)
-    _, in_target, _ = split_groups(shelf, group_names)
-    missing = [b for b in moved if b not in in_target]
-    return missing
+    actual = {}
+    for a in shelf.get("archive", []):
+        for bid in a.get("bookIds", []):
+            actual[bid] = a["name"]
+    return [(b, g, actual.get(b)) for b, g in expected.items() if actual.get(b) != g]
 
 
 def cmd_apply(args):
     plan = json.load(open(args.plan, encoding="utf-8"))
     hdrs = headers(get_cred())
-    group_names = set(plan["group_archive_ids"]) | {m["to"] for m in plan["moves"]}
     if args.dry_run:
         log(f"[DRY-RUN] 将迁移 {len(plan['moves'])} 本")
         return
@@ -314,10 +348,11 @@ def cmd_apply(args):
     for m in plan["moves"]:
         by_group.setdefault(m["to"], []).append(m["bookId"])
     moved, failed = _do_moves(hdrs, by_group, plan["group_archive_ids"])
-    missing = _verify(hdrs, moved, group_names)
-    log(f"迁移完成: 成功 {len(moved)} 本, 失败 {len(failed)} 本, 核验未落位 {len(missing)} 本")
-    if missing:
-        log(f"⚠️ 未落位: {[b[:8] for b in missing[:10]]}")
+    expected = {m["bookId"]: m["to"] for m in plan["moves"]}
+    wrong = _verify(hdrs, {b: expected[b] for b in moved})
+    log(f"迁移完成: 成功 {len(moved)} 本, 失败 {len(failed)} 本, 核验错位 {len(wrong)} 本")
+    for b, want, got in wrong[:10]:
+        log(f"  ⚠️ {b[:8]} 期望「{want}」实际「{got}」")
 
 
 def cmd_review(args):
@@ -333,8 +368,11 @@ def cmd_review(args):
             continue
         by_group.setdefault(g, []).append(str(d["bookId"]))
     moved, failed = _do_moves(hdrs, by_group, aid)
-    missing = _verify(hdrs, moved, set(aid))
-    log(f"复核应用完成: 移动 {len(moved)} 本, 失败 {len(failed)}, 未落位 {len(missing)}")
+    expected = {str(d["bookId"]): d["group"] for d in decisions}
+    wrong = _verify(hdrs, {b: expected[b] for b in moved})
+    log(f"复核应用完成: 移动 {len(moved)} 本, 失败 {len(failed)}, 核验错位 {len(wrong)}")
+    for b, want, got in wrong[:10]:
+        log(f"  ⚠️ {b[:8]} 期望「{want}」实际「{got}」")
 
 
 def cmd_groups(args):
@@ -380,13 +418,14 @@ def cmd_groups(args):
 def cmd_verify(args):
     plan = json.load(open(args.plan, encoding="utf-8"))
     hdrs = headers(get_cred())
-    group_names = set(plan["group_archive_ids"]) | {m["to"] for m in plan["moves"]}
-    moved = [m["bookId"] for m in plan["moves"]]
-    missing = _verify(hdrs, moved, group_names)
-    if missing:
-        log(f"❌ {len(missing)} 本未落位: {[b[:8] for b in missing[:10]]}")
+    expected = {m["bookId"]: m["to"] for m in plan["moves"]}
+    wrong = _verify(hdrs, expected)
+    if wrong:
+        for b, want, got in wrong[:10]:
+            log(f"  ❌ {b[:8]} 期望「{want}」实际「{got}」")
+        log(f"❌ {len(wrong)} 本未落位/错位")
         sys.exit(1)
-    log(f"✅ 全部落位 ({len(moved)} 本)")
+    log(f"✅ 全部落位到预期分组 ({len(expected)} 本)")
 
 
 def main():

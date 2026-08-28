@@ -65,8 +65,11 @@ python3 $S verify --plan plan.json    # 独立核验
 
 - `groups`：目标分组（name 需以两位数字前缀开头便于识别，description 用于 AI 复核时判断）
 - `category_map`：微信平台分类 → 分组。支持完整分类（`经济理财-商业`）和主栏目（`精品小说`）
+- `confidence`：命中置信度（完整命中默认 0.95，主栏目命中默认 0.75）
+- `min_confidence`：自动迁移阈值（默认 0.6）。低于阈值的进复核清单；
+  有候选但低于阈值时，`plan.json` 的 review 条目会带 `suggest` 字段供复核参考
 - 可选 `--baseline base.csv`（`bookId,target_group` 两列）：用户已有分类表（如 Excel 导出）时，
-  基线优先级最高；无基线则纯靠 category_map + AI 复核
+  基线优先级最高（confidence=1.0）；无基线则纯靠 category_map + AI 复核
 
 ### 第 1 步：凭据验证
 
@@ -75,6 +78,9 @@ python3 $S creds
 ```
 
 **凭据失效**（stderr 出现 FATAL）：提示用户打开微信读书 Mac 客户端确认登录（必要时重新扫码），用户确认后重试。不要绕过、不要重试超过 2 次。
+
+**无 Mac 客户端的环境**（Linux/Windows/CI）：可设环境变量 `WEREAD_VID` / `WEREAD_SKEY`
+（可选 `WEREAD_V`）提供凭据，脚本验证通过即用，无需客户端。
 
 ### 第 2 步：生成计划
 
@@ -144,3 +150,5 @@ python3 $S verify --plan plan.json
 
 - `references/api.md` — 接口明细、请求头、错误码、常见问题
 - `examples/rules.example.json` — 12 分组示例规则（可直接改用）
+- `tests/` — 离线回归测试（`python3 -m unittest discover -s tests`，全 mock 无网络）；
+  改动分类/迁移逻辑后必须先跑通测试
