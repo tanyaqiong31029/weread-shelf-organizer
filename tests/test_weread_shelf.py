@@ -114,7 +114,8 @@ class PlanTests(unittest.TestCase):
     def test_plan_with_review_books_no_crash(self):
         """回归: 存在未映射分类书时 plan 不崩溃, 且正确分流 moves/review。"""
         self._run_plan()
-        plan = json.load(open(self.plan_path, encoding="utf-8"))
+        with open(self.plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
         self.assertEqual([m["bookId"] for m in plan["moves"]], ["1"])
         self.assertEqual({r["bookId"] for r in plan["review"]}, {"2", "3"})
         self.assertEqual(plan["moves"][0]["to"], "03 商业经济")
@@ -131,7 +132,8 @@ class PlanTests(unittest.TestCase):
         # 把书 1 换成主栏目命中(0.75 < 0.8)
         self.shelf["books"][0]["category"] = "精品小说-悬疑推理"
         self._run_plan()
-        plan = json.load(open(self.plan_path, encoding="utf-8"))
+        with open(self.plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
         self.assertEqual(plan["moves"], [])
         r = next(r for r in plan["review"] if r["bookId"] == "1")
         self.assertEqual(r["suggest"], "09 类型小说")
@@ -142,7 +144,8 @@ class PlanTests(unittest.TestCase):
         base.write_text("\ufeffbookId,target_group\n2,01 成长学习\n",
                         encoding="utf-8")
         self._run_plan(baseline=str(base))
-        plan = json.load(open(self.plan_path, encoding="utf-8"))
+        with open(self.plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
         m = next(m for m in plan["moves"] if m["bookId"] == "2")
         self.assertEqual(m["to"], "01 成长学习")
         self.assertEqual(m["confidence"], 1.0)

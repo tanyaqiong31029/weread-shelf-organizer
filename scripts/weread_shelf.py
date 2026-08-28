@@ -92,6 +92,11 @@ def http_json(url, payload=None, hdrs=None, timeout=30):
         return json.loads(r.read())
 
 
+def _mask(vid):
+    """日志中脱敏 vid, 避免录屏/日志泄露个人标识。"""
+    return f"{vid[:2]}****{vid[-2:]}" if vid and len(vid) > 4 else "****"
+
+
 def get_cred(retry=2):
     # 路径 1: 环境变量 (适用于无 Mac 客户端的环境, 如 Linux/CI, 凭据自行提取)
     vid, skey = os.environ.get("WEREAD_VID"), os.environ.get("WEREAD_SKEY")
@@ -101,7 +106,7 @@ def get_cred(retry=2):
         try:
             http_json(f"{API}/shelf/sync?userFlag=0&synckey=&teenmode=0&album=1",
                       hdrs=headers(cred))
-            log(f"凭据有效 (环境变量, vid={vid})")
+            log(f"凭据有效 (环境变量, vid={_mask(vid)})")
             return cred
         except urllib.error.HTTPError as e:
             log(f"环境变量凭据无效(HTTP {e.code}), 回退到客户端日志提取")
@@ -112,7 +117,7 @@ def get_cred(retry=2):
             try:
                 http_json(f"{API}/shelf/sync?userFlag=0&synckey=&teenmode=0&album=1",
                           hdrs=headers(cred))
-                log(f"凭据有效 (vid={cred['vid']}, v={cred['v']})")
+                log(f"凭据有效 (vid={_mask(cred['vid'])})")
                 return cred
             except urllib.error.HTTPError as e:
                 log(f"凭据无效(HTTP {e.code}), 重启客户端刷新登录 ({attempt + 1}/{retry})")
@@ -339,7 +344,8 @@ def _verify(hdrs, expected):
 
 
 def cmd_apply(args):
-    plan = json.load(open(args.plan, encoding="utf-8"))
+    with open(args.plan, encoding="utf-8") as f:
+        plan = json.load(f)
     hdrs = headers(get_cred())
     if args.dry_run:
         log(f"[DRY-RUN] 将迁移 {len(plan['moves'])} 本")
@@ -356,7 +362,8 @@ def cmd_apply(args):
 
 
 def cmd_review(args):
-    decisions = json.load(open(args.decisions, encoding="utf-8"))
+    with open(args.decisions, encoding="utf-8") as f:
+        decisions = json.load(f)
     hdrs = headers(get_cred())
     shelf = sync_shelf(hdrs)
     aid = {a["name"]: a["archiveId"] for a in shelf.get("archive", [])}
@@ -416,7 +423,8 @@ def cmd_groups(args):
 
 
 def cmd_verify(args):
-    plan = json.load(open(args.plan, encoding="utf-8"))
+    with open(args.plan, encoding="utf-8") as f:
+        plan = json.load(f)
     hdrs = headers(get_cred())
     expected = {m["bookId"]: m["to"] for m in plan["moves"]}
     wrong = _verify(hdrs, expected)
