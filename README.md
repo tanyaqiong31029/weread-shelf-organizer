@@ -72,6 +72,15 @@ python3 weread_shelf.py apply --plan plan.json   # 执行迁移 + 核验
 python3 weread_shelf.py groups --purge-empty     # 清理空分组
 ```
 
+**把指定旧分组打散重排（重组模式，双重确认）：**
+
+```bash
+# ① 基线 CSV + 白名单来源分组生成计划（只动白名单里的分组）
+python3 weread_shelf.py plan --rules examples/rules.example.json     --baseline my_base.csv     --source-group "探照灯好书小说2,豆瓣评分9.0以上的书籍"     --reorganize -o plan.json --dry-run
+# ② 人工复核 plan.json 后确认执行（缺 --yes 会拒绝）
+python3 weread_shelf.py apply --plan plan.json --yes --json-report report.json
+```
+
 分组规则见 `examples/rules.example.json`（12 分组示例 + 平台分类映射，改成分你自己的即可）。
 
 ## 🧠 工作原理
@@ -92,9 +101,14 @@ python3 weread_shelf.py groups --purge-empty     # 清理空分组
 python3 -m unittest discover -s tests -v
 ```
 
-14 个离线回归测试（全 mock、无网络）：classify 元数一致性、含待复核书的端到端 plan、
-置信度阈值分流、正确分组核验、环境变量凭据、批次切分、基线解析等。
+26 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
+含待复核书的端到端 plan、置信度阈值分流、正确分组核验、重组白名单边界、执行前状态校验、
+核验失败非零退出、`--json-report` 结构化报告、环境变量凭据、批次切分、基线解析等。
 推送后由 GitHub Actions 自动执行。
+
+**自动化集成**：`apply`/`review` 的退出码 — `0` 成功；`1` 存在迁移失败或核验错位；
+`2` 凭据失效；`3` 重组迁移未加 `--yes`。配合 `--json-report` 可获得结构化的
+moved/failed/stale/wrong 结果，定时任务据此判断成败。
 
 ## 🛡️ 安全设计
 

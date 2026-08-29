@@ -377,6 +377,11 @@ def plan_age_hours(plan):
         return 0.0
 
 
+def _write_json_report(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    log(f"结构化报告 → {path}")
+
+
 def cmd_apply(args):
     with open(args.plan, encoding="utf-8") as f:
         plan = json.load(f)
@@ -418,6 +423,17 @@ def cmd_apply(args):
         f"跳过状态不符 {len(stale)} 本, 核验错位 {len(wrong)} 本")
     for b, want, got in wrong[:10]:
         log(f"  ⚠️ {b[:8]} 期望「{want}」实际「{got}」")
+    if args.json_report:
+        _write_json_report(args.json_report, {
+            "command": "apply", "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "planned": len(plan["moves"]), "moved": sorted(moved),
+            "failed": sorted(failed),
+            "stale": [{"bookId": m["bookId"], "planned_from": m.get("from"),
+                       "actual_group": now} for m, now in stale],
+            "wrong": [{"bookId": b, "expected": w, "actual": g} for b, w, g in wrong]})
+    if failed or wrong:
+        log("❌ 存在失败或核验错位, 以非零退出码结束 (细节见上方日志/报告)")
+        sys.exit(1)
 
 
 def cmd_review(args):
@@ -454,6 +470,15 @@ def cmd_review(args):
         f"跳过状态不符 {skipped}, 核验错位 {len(wrong)}")
     for b, want, got in wrong[:10]:
         log(f"  ⚠️ {b[:8]} 期望「{want}」实际「{got}」")
+    if args.json_report:
+        _write_json_report(args.json_report, {
+            "command": "review", "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "planned": len(decisions), "moved": sorted(moved), "failed": sorted(failed),
+            "stale": skipped,
+            "wrong": [{"bookId": b, "expected": w, "actual": g} for b, w, g in wrong]})
+    if failed or wrong:
+        log("❌ 存在失败或核验错位, 以非零退出码结束 (细节见上方日志/报告)")
+        sys.exit(1)
 
 
 def cmd_groups(args):
@@ -535,9 +560,11 @@ def main():
     p.add_argument("--plan", required=True)
     p.add_argument("--yes", action="store_true",
                    help="确认执行含「来自已有分组」书籍的重组迁移")
+    p.add_argument("--json-report", help="写入结构化结果 JSON (moved/failed/stale/wrong)")
 
     p = sub.add_parser("review", help="应用复核定类")
-    p.add_argument("--decisions", required=True, help='JSON: [{"bookId":"..","group":".."}]')
+    p.add_argument("--decisions", required=True, help='JSON: [{"bookId":"..","group":"..","from":null}]')
+    p.add_argument("--json-report", help="写入结构化结果 JSON (moved/failed/stale/wrong)")
 
     p = sub.add_parser("groups", help="分组管理")
     p.add_argument("--create", help="创建分组")

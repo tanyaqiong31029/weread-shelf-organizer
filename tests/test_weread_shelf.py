@@ -298,12 +298,34 @@ class ReorganizePlanTests(unittest.TestCase):
         self.assertEqual(plan["source_snapshot"], {})
 
 
+class FakeShelf:
+    """有状态假书架: http_json 的迁移会真实改变状态, 第二次同步反映迁移结果。"""
+
+    def __init__(self, groups):
+        # groups: {name: (archiveId, [bookIds])}
+        self.g = {n: {"archiveId": i, "ids": list(ids)} for n, (i, ids) in groups.items()}
+
+    def shelf(self):
+        return {"books": [], "archive": [
+            {"name": n, "archiveId": v["archiveId"], "bookIds": list(v["ids"])}
+            for n, v in self.g.items()]}
+
+    def apply_move(self, ids, name):
+        ids = list(ids)
+        for v in self.g.values():
+            v["ids"] = [x for x in v["ids"] if x not in ids]
+        self.g.setdefault(name, {"archiveId": 999, "ids": []})
+        self.g[name]["ids"].extend(ids)
+
+
 class ApplySafetyTests(unittest.TestCase):
-    """安全回归: apply 执行前重校验书架状态, 重组迁移必须 --yes。"""
+    """安全回归: apply 执行前重校验书架状态, 重组迁移必须 --yes,
+    迁移失败/核验错位必须以非零退出码结束。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.plan_path = str(Path(self.tmp.name) / "plan.json")
+        self._write_plan()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -321,97 +343,114 @@ class ApplySafetyTests(unittest.TestCase):
                 "group_archive_ids": {"03 商业经济": 303}, "missing_groups": []}
         Path(self.plan_path).write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
 
-    def _shelf(self, book2_group):
-        groups = [{"name": "03 商业经济", "archiveId": 303, "bookIds": []}]
-        if book2_group:
-            groups.append({"name": book2_group, "archiveId": 11, "bookIds": ["2"]})
-        return {"books": [], "archive": groups}
-
-    def _run_apply(self, shelf, yes):
+    def _run_apply(self, groups, yes, lie=False, json_report=None):
+        """groups: {分组名: (archiveId, [bookIds])}; lie=True 时接口谎报成功但状态不变。"""
+        fs = FakeShelf(groups)
         calls = []
 
         def fake_http(url, payload=None, hdrs=None, timeout=30):
             calls.append(payload)
+            if payload and "bookIds" in payload and not lie:
+                fs.apply_move(payload["bookIds"], payload["name"])
             return {"succ": 1}
 
         with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
                                                             "v": "1", "ua": "u"}), \
-             mock.patch.object(W, "sync_shelf", return_value=shelf), \
+             mock.patch.object(W, "sync_shelf", side_effect=lambda *a, **k: fs.shelf()), \
              mock.patch.object(W, "http_json", side_effect=fake_http), \
              mock.patch.object(W.time, "sleep"):
-            W.cmd_apply(ns(plan=self.plan_path, dry_run=False, yes=yes))
-        return calls
+            W.cmd_apply(ns(plan=self.plan_path, dry_run=False, yes=yes,
+                           json_report=json_report))
+        return calls, fs
 
     def test_stale_plan_entries_are_skipped(self):
         """计划生成后书2被移到别的分组 → 该条自动跳过, 只执行仍有效的迁移。"""
-        self._write_plan()
-        calls = self._run_apply(self._shelf("旧榜单B"), yes=False)
+        calls, _ = self._run_apply(
+            {"旧榜单B": (11, ["2"]), "03 商业经济": (303, [])}, yes=False)
         moved_ids = [i for c in calls for i in c["bookIds"]]
         self.assertEqual(moved_ids, ["1"])
 
     def test_reorganize_requires_explicit_yes(self):
-        """重组迁移(来自已有分组)未加 --yes 时必须拒绝执行。"""
-        self._write_plan()
+        """重组迁移(来自已有分组)未加 --yes 时必须拒绝执行, 一本都不能动。"""
         with self.assertRaises(SystemExit) as cm:
-            self._run_apply(self._shelf("旧榜单A"), yes=False)
+            self._run_apply(
+                {"旧榜单A": (11, ["2"]), "03 商业经济": (303, [])}, yes=False)
         self.assertEqual(cm.exception.code, 3)
 
-    def test_yes_executes_full_plan(self):
-        self._write_plan()
-        calls = self._run_apply(self._shelf("旧榜单A"), yes=True)
-        moved_ids = [i for c in calls for i in c["bookIds"]]
-        self.assertEqual(sorted(moved_ids), ["1", "2"])
+    def test_yes_executes_full_plan_and_verify_passes(self):
+        """加 --yes 后执行, 且核验基于「迁移后」的书架状态通过。"""
+        calls, fs = self._run_apply(
+            {"旧榜单A": (11, ["2"]), "03 商业经济": (303, [])}, yes=True)
+        moved_ids = sorted(i for c in calls for i in c["bookIds"])
+        self.assertEqual(moved_ids, ["1", "2"])
+        self.assertEqual(fs.g["03 商业经济"]["ids"], ["1", "2"])   # 状态真实落位
+
+    def test_verify_failure_exits_nonzero(self):
+        """接口谎报成功但状态未变 → 核验错位必须以非零退出码结束。"""
+        with self.assertRaises(SystemExit) as cm:
+            self._run_apply(
+                {"旧榜单A": (11, ["2"]), "03 商业经济": (303, [])},
+                yes=True, lie=True)
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_json_report_written(self):
+        rp = str(Path(self.tmp.name) / "report.json")
+        self._run_apply(
+            {"旧榜单A": (11, ["2"]), "03 商业经济": (303, [])},
+            yes=True, json_report=rp)
+        with open(rp, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(report["command"], "apply")
+        self.assertEqual(sorted(report["moved"]), ["1", "2"])
+        self.assertEqual(report["failed"], [])
+        self.assertEqual(report["wrong"], [])
 
 
 class ReviewSafetyTests(unittest.TestCase):
-    """安全回归: review 决定执行前校验当前分组状态。"""
+    """安全回归: review 决定执行前校验当前分组状态, 核验失败非零退出。"""
+
+    def _run_review(self, decisions, groups, lie=False):
+        fs = FakeShelf(groups)
+        calls = []
+
+        def fake_http(url, payload=None, hdrs=None, timeout=30):
+            calls.append(payload)
+            if payload and "bookIds" in payload and not lie:
+                fs.apply_move(payload["bookIds"], payload["name"])
+            return {"succ": 1}
+
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d) / "d.json"
+            dp.write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                                "v": "1", "ua": "u"}), \
+                 mock.patch.object(W, "sync_shelf", side_effect=lambda *a, **k: fs.shelf()), \
+                 mock.patch.object(W, "http_json", side_effect=fake_http), \
+                 mock.patch.object(W.time, "sleep"):
+                W.cmd_review(ns(decisions=str(dp), json_report=None))
+        return calls, fs
 
     def test_review_skips_mismatched_state(self):
-        decisions = [{"bookId": "2", "group": "03 商业经济"}]          # 无 from → 预期未分组
-        shelf = {"books": [], "archive": [
-            {"name": "03 商业经济", "archiveId": 303, "bookIds": []},
-            {"name": "旧榜单A", "archiveId": 11, "bookIds": ["2"]},     # 书2已在分组 → 不符
-        ]}
-        calls = []
-
-        def fake_http(url, payload=None, hdrs=None, timeout=30):
-            calls.append(payload)
-            return {"succ": 1}
-
-        with tempfile.TemporaryDirectory() as d:
-            dp = Path(d) / "d.json"
-            dp.write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
-            with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
-                                                                "v": "1", "ua": "u"}), \
-                 mock.patch.object(W, "sync_shelf", return_value=shelf), \
-                 mock.patch.object(W, "http_json", side_effect=fake_http), \
-                 mock.patch.object(W.time, "sleep"):
-                W.cmd_review(ns(decisions=str(dp)))
-        self.assertEqual(calls, [])   # 状态不符, 一本都不应移动
+        """无 from 的决定要求书处于未分组; 书已在分组 → 一本都不动。"""
+        calls, _ = self._run_review(
+            [{"bookId": "2", "group": "03 商业经济"}],
+            {"03 商业经济": (303, []), "旧榜单A": (11, ["2"])})
+        self.assertEqual(calls, [])
 
     def test_review_moves_when_state_matches(self):
-        decisions = [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}]
-        shelf = {"books": [], "archive": [
-            {"name": "03 商业经济", "archiveId": 303, "bookIds": []},
-            {"name": "旧榜单A", "archiveId": 11, "bookIds": ["2"]},
-        ]}
-        calls = []
-
-        def fake_http(url, payload=None, hdrs=None, timeout=30):
-            calls.append(payload)
-            return {"succ": 1}
-
-        with tempfile.TemporaryDirectory() as d:
-            dp = Path(d) / "d.json"
-            dp.write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
-            with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
-                                                                "v": "1", "ua": "u"}), \
-                 mock.patch.object(W, "sync_shelf", return_value=shelf), \
-                 mock.patch.object(W, "http_json", side_effect=fake_http), \
-                 mock.patch.object(W.time, "sleep"):
-                W.cmd_review(ns(decisions=str(dp)))
+        calls, fs = self._run_review(
+            [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}],
+            {"03 商业经济": (303, []), "旧榜单A": (11, ["2"])})
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["bookIds"], ["2"])
+        self.assertEqual(fs.g["03 商业经济"]["ids"], ["2"])
+
+    def test_review_verify_failure_exits_nonzero(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._run_review(
+                [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}],
+                {"03 商业经济": (303, []), "旧榜单A": (11, ["2"])}, lie=True)
+        self.assertEqual(cm.exception.code, 1)
 
 
 if __name__ == "__main__":

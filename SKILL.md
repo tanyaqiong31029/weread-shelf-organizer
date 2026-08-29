@@ -40,8 +40,8 @@ python3 $S creds                      # 提取并验证凭据（失败→见"凭
 python3 $S sync -o snapshot.json      # 书架快照
 python3 $S plan  --rules rules.json [--baseline base.csv] \
                  [--reorganize --source-group "旧榜单A,旧榜单B"] [-o plan.json] [--dry-run]
-python3 $S apply --plan plan.json [--yes]   # 重组类迁移必须 --yes
-python3 $S review --decisions d.json        # 应用复核定类（自动重校验状态）
+python3 $S apply --plan plan.json [--yes] [--json-report report.json]
+python3 $S review --decisions d.json [--json-report report.json]
 python3 $S groups --list              # 列出分组
 python3 $S groups --create "01 成长学习"
 python3 $S groups --purge-empty       # 清理空分组
@@ -153,6 +153,18 @@ python3 $S verify --plan plan.json
 | **全量重组**（用户给出分类表 + 指定要打散的旧分组） | 表格转 baseline CSV → `plan --baseline --reorganize --source-group "旧榜单A,旧榜单B"` → **人工复核 plan.json** → `apply --yes`。只动白名单分组，其他分组永不触碰 |
 | **从零分类**（无表，只有分组设想） | 写 rules.json（分组 + category_map）→ plan → AI 对 review[] 全量定类 → apply |
 | **增量整理**（日常新书归类） | 直接 `plan`（默认只处理未分组书）→ apply → review |
+
+## 退出码（自动化集成）
+
+| 码 | 含义 |
+|----|------|
+| 0 | 成功 |
+| 1 | 存在迁移失败或核验错位 |
+| 2 | 凭据失效 |
+| 3 | 重组迁移未加 `--yes` 确认 |
+
+`apply`/`review` 支持 `--json-report 文件路径`，输出结构化
+`moved/failed/stale/wrong` 结果，供定时任务判断成败。
 
 ## 参考文件
 
