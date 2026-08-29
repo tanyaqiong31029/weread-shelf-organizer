@@ -1,0 +1,50 @@
+name: 🐛 Bug 报告
+description: 报告问题请附环境、版本、复现步骤与脱敏日志
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **提交前务必脱敏**：不要粘贴 vid、skey、cookie 或任何凭据；
+        日志中的 vid 已被脚本脱敏为 `47****14` 形式，可直接附带。
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: macOS 版本 / 微信读书客户端版本 / python3 版本 / 是否使用环境变量凭据
+      placeholder: "如：macOS 15.5 (M2) · 微信读书 10.2.1 · Python 3.11"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Skill 版本
+      description: git commit 哈希或 Release 版本号
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: "1. 运行 `python3 weread_shelf.py plan ...`\n2. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 vs 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志（已脱敏）
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 日志与截图已脱敏，不含任何凭据
+          required: true
+        - label: 已搜索现有 Issue，无重复
+          required: true
