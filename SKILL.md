@@ -19,11 +19,15 @@ description: 微信读书书架自动整理技能 — 全量重组、增量归�
 
 ## 核心约束（安全红线）
 
-1. **只移动「未分组」的书**。用户放入其他自定义分组的书一律跳过（脚本已内置该逻辑）。
-2. **不删除书籍、不移出书架、不改变私密状态、不动专辑/文章收藏**。
-3. 迁移后**必须核验落位**（`verify`），报告未落位清单。
-4. 先 `--dry-run` 出计划，向用户展示或确认后再 `apply`。
-5. 拿不准分类的书**宁可保留「需复核」也不要硬塞**，在报告中列出请用户定夺。
+1. **默认只移动「未分组」的书**。用户放入其他自定义分组的书一律跳过；
+   唯一例外是**重组模式**（`--reorganize --source-group "白名单"`），
+   且只动白名单里的来源分组，执行时必须 `apply --yes` 人工确认。
+2. **执行前强制重校验**：`apply`/`review` 会重新同步书架，逐本核对
+   「当前分组 == 计划记录的来源分组」，不符自动跳过——计划过期或被篡改都无法越过本红线。
+3. **不删除书籍、不移出书架、不改变私密状态、不动专辑/文章收藏**。
+4. 迁移后**必须核验落位**（`verify`），报告未落位清单。
+5. 先 `--dry-run` 出计划，向用户展示或确认后再 `apply`。
+6. 拿不准分类的书**宁可保留「需复核」也不要硬塞**，在报告中列出请用户定夺。
 
 ## 脚本用法
 
@@ -34,9 +38,10 @@ S=scripts/weread_shelf.py
 
 python3 $S creds                      # 提取并验证凭据（失败→见"凭据失效"）
 python3 $S sync -o snapshot.json      # 书架快照
-python3 $S plan  --rules rules.json [--baseline base.csv] -o plan.json [--dry-run]
-python3 $S apply --plan plan.json     # 批量迁移 + 自动核验
-python3 $S review --decisions d.json  # 应用复核定类
+python3 $S plan  --rules rules.json [--baseline base.csv] \
+                 [--reorganize --source-group "旧榜单A,旧榜单B"] [-o plan.json] [--dry-run]
+python3 $S apply --plan plan.json [--yes]   # 重组类迁移必须 --yes
+python3 $S review --decisions d.json        # 应用复核定类（自动重校验状态）
 python3 $S groups --list              # 列出分组
 python3 $S groups --create "01 成长学习"
 python3 $S groups --purge-empty       # 清理空分组
@@ -89,8 +94,9 @@ python3 $S plan --rules rules.json -o plan.json --dry-run
 ```
 
 产出 `plan.json`：
-- `moves[]`：自动迁移清单（含去向、依据）
-- `review[]`：低置信度待复核清单（书名/作者/平台分类/提示）
+- `moves[]`：自动迁移清单（含 `from` 来源分组、去向、依据；`from: null` 表示计划时未分组）
+- `review[]`：低置信度待复核清单（书名/作者/平台分类/提示/来源）
+- `source_snapshot`：重组模式下白名单来源分组的书籍快照（审计用）
 - `missing_groups`：不存在的目标分组
 - `skipped_custom_groups`：用户自定义分组（不会触碰）
 
@@ -111,10 +117,12 @@ python3 $S groups --create "01 成长学习"   # 逐个创建 missing_groups
 写出 `decisions.json`：
 
 ```json
-[{"bookId": "3300138205", "group": "01 成长学习"}]
+[{"bookId": "3300138205", "group": "01 成长学习", "from": null}]
 ```
 
 - `group` 必须是规则文件中的分组名（中文名，不是代码）
+- `from` 从 `review[]` 条目原样复制（重组模式下来自某个分组时必须带上，
+  否则执行时会因状态不符被跳过）
 - 确实拿不准的**不要写入**，让它留在复核清单里向用户汇报
 
 ### 第 4 步：执行迁移
@@ -142,7 +150,7 @@ python3 $S verify --plan plan.json
 
 | 场景 | 做法 |
 |------|------|
-| **全量重组**（用户给出分类表/Excel） | 表格转 baseline CSV（bookId + 目标分组两列）→ `plan --baseline` → AI 补齐表中没有的书 → apply |
+| **全量重组**（用户给出分类表 + 指定要打散的旧分组） | 表格转 baseline CSV → `plan --baseline --reorganize --source-group "旧榜单A,旧榜单B"` → **人工复核 plan.json** → `apply --yes`。只动白名单分组，其他分组永不触碰 |
 | **从零分类**（无表，只有分组设想） | 写 rules.json（分组 + category_map）→ plan → AI 对 review[] 全量定类 → apply |
 | **增量整理**（日常新书归类） | 直接 `plan`（默认只处理未分组书）→ apply → review |
 

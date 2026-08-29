@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -109,7 +110,9 @@ class PlanTests(unittest.TestCase):
                                                             "v": "1", "ua": "u"}), \
              mock.patch.object(W, "sync_shelf", return_value=self.shelf):
             W.cmd_plan(ns(rules=self.rules_path, baseline=kw.get("baseline"),
-                          output=self.plan_path, full=False, dry_run=False))
+                          output=self.plan_path, dry_run=False,
+                          reorganize=kw.get("reorganize", False),
+                          source_group=kw.get("source_group")))
 
     def test_plan_with_review_books_no_crash(self):
         """回归: 存在未映射分类书时 plan 不崩溃, 且正确分流 moves/review。"""
@@ -235,6 +238,180 @@ class BaselineTests(unittest.TestCase):
                          encoding="utf-8")
             base = W.load_baseline(str(p))
         self.assertEqual(base, {"123": "03 商业经济"})
+
+
+class ReorganizePlanTests(unittest.TestCase):
+    """安全回归: 重组模式只能动显式白名单里的来源分组。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rp = Path(self.tmp.name) / "rules.json"
+        rp.write_text(json.dumps(RULES), encoding="utf-8")
+        self.rules_path = str(rp)
+        self.plan_path = str(Path(self.tmp.name) / "plan.json")
+        # 书1未分组; 书2在旧榜单A; 书3在旧榜单B; 分类全部命中映射
+        self.shelf = {"books": [
+            {"bookId": "1", "title": "未分组书", "author": "a", "category": "经济理财-商业"},
+            {"bookId": "2", "title": "榜单书A", "author": "b", "category": "经济理财-商业"},
+            {"bookId": "3", "title": "榜单书B", "author": "c", "category": "经济理财-商业"},
+        ], "archive": [
+            {"name": "旧榜单A", "archiveId": 11, "bookIds": ["2"]},
+            {"name": "旧榜单B", "archiveId": 12, "bookIds": ["3"]},
+            {"name": "03 商业经济", "archiveId": 303, "bookIds": []},
+        ]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _plan(self, **kw):
+        with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                            "v": "1", "ua": "u"}), \
+             mock.patch.object(W, "sync_shelf", return_value=self.shelf):
+            W.cmd_plan(ns(rules=self.rules_path, baseline=None, dry_run=False,
+                          output=self.plan_path,
+                          reorganize=kw.get("reorganize", False),
+                          source_group=kw.get("source_group")))
+        with open(self.plan_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_default_never_touches_grouped_books(self):
+        plan = self._plan()
+        self.assertEqual([m["bookId"] for m in plan["moves"]], ["1"])
+        self.assertEqual(plan["moves"][0]["from"], None)
+
+    def test_reorganize_without_whitelist_is_incremental(self):
+        plan = self._plan(reorganize=True, source_group="")
+        self.assertEqual([m["bookId"] for m in plan["moves"]], ["1"])
+
+    def test_reorganize_only_whitelisted_source(self):
+        plan = self._plan(reorganize=True, source_group="旧榜单A")
+        by_id = {m["bookId"]: m for m in plan["moves"]}
+        self.assertIn("1", by_id)
+        self.assertEqual(by_id["2"]["from"], "旧榜单A")   # 白名单分组, 记录来源
+        self.assertNotIn("3", by_id)                      # 非白名单分组不动
+        self.assertEqual(plan["source_snapshot"], {"旧榜单A": ["2"]})
+        self.assertEqual(plan["mode"], "reorganize")
+
+    def test_reorganize_unknown_source_group_ignored(self):
+        plan = self._plan(reorganize=True, source_group="不存在的榜")
+        self.assertEqual([m["bookId"] for m in plan["moves"]], ["1"])
+        self.assertEqual(plan["source_snapshot"], {})
+
+
+class ApplySafetyTests(unittest.TestCase):
+    """安全回归: apply 执行前重校验书架状态, 重组迁移必须 --yes。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.plan_path = str(Path(self.tmp.name) / "plan.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_plan(self):
+        plan = {"generated_at": datetime.now().isoformat(timespec="seconds"),
+                "mode": "reorganize", "total_books": 2, "ungrouped": 1,
+                "moves": [
+                    {"bookId": "1", "title": "未分组书", "from": None, "to": "03 商业经济",
+                     "basis": "t", "confidence": 1.0},
+                    {"bookId": "2", "title": "榜单书A", "from": "旧榜单A", "to": "03 商业经济",
+                     "basis": "t", "confidence": 1.0},
+                ],
+                "review": [], "skipped_custom_groups": {}, "source_snapshot": {},
+                "group_archive_ids": {"03 商业经济": 303}, "missing_groups": []}
+        Path(self.plan_path).write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    def _shelf(self, book2_group):
+        groups = [{"name": "03 商业经济", "archiveId": 303, "bookIds": []}]
+        if book2_group:
+            groups.append({"name": book2_group, "archiveId": 11, "bookIds": ["2"]})
+        return {"books": [], "archive": groups}
+
+    def _run_apply(self, shelf, yes):
+        calls = []
+
+        def fake_http(url, payload=None, hdrs=None, timeout=30):
+            calls.append(payload)
+            return {"succ": 1}
+
+        with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                            "v": "1", "ua": "u"}), \
+             mock.patch.object(W, "sync_shelf", return_value=shelf), \
+             mock.patch.object(W, "http_json", side_effect=fake_http), \
+             mock.patch.object(W.time, "sleep"):
+            W.cmd_apply(ns(plan=self.plan_path, dry_run=False, yes=yes))
+        return calls
+
+    def test_stale_plan_entries_are_skipped(self):
+        """计划生成后书2被移到别的分组 → 该条自动跳过, 只执行仍有效的迁移。"""
+        self._write_plan()
+        calls = self._run_apply(self._shelf("旧榜单B"), yes=False)
+        moved_ids = [i for c in calls for i in c["bookIds"]]
+        self.assertEqual(moved_ids, ["1"])
+
+    def test_reorganize_requires_explicit_yes(self):
+        """重组迁移(来自已有分组)未加 --yes 时必须拒绝执行。"""
+        self._write_plan()
+        with self.assertRaises(SystemExit) as cm:
+            self._run_apply(self._shelf("旧榜单A"), yes=False)
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_yes_executes_full_plan(self):
+        self._write_plan()
+        calls = self._run_apply(self._shelf("旧榜单A"), yes=True)
+        moved_ids = [i for c in calls for i in c["bookIds"]]
+        self.assertEqual(sorted(moved_ids), ["1", "2"])
+
+
+class ReviewSafetyTests(unittest.TestCase):
+    """安全回归: review 决定执行前校验当前分组状态。"""
+
+    def test_review_skips_mismatched_state(self):
+        decisions = [{"bookId": "2", "group": "03 商业经济"}]          # 无 from → 预期未分组
+        shelf = {"books": [], "archive": [
+            {"name": "03 商业经济", "archiveId": 303, "bookIds": []},
+            {"name": "旧榜单A", "archiveId": 11, "bookIds": ["2"]},     # 书2已在分组 → 不符
+        ]}
+        calls = []
+
+        def fake_http(url, payload=None, hdrs=None, timeout=30):
+            calls.append(payload)
+            return {"succ": 1}
+
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d) / "d.json"
+            dp.write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                                "v": "1", "ua": "u"}), \
+                 mock.patch.object(W, "sync_shelf", return_value=shelf), \
+                 mock.patch.object(W, "http_json", side_effect=fake_http), \
+                 mock.patch.object(W.time, "sleep"):
+                W.cmd_review(ns(decisions=str(dp)))
+        self.assertEqual(calls, [])   # 状态不符, 一本都不应移动
+
+    def test_review_moves_when_state_matches(self):
+        decisions = [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}]
+        shelf = {"books": [], "archive": [
+            {"name": "03 商业经济", "archiveId": 303, "bookIds": []},
+            {"name": "旧榜单A", "archiveId": 11, "bookIds": ["2"]},
+        ]}
+        calls = []
+
+        def fake_http(url, payload=None, hdrs=None, timeout=30):
+            calls.append(payload)
+            return {"succ": 1}
+
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d) / "d.json"
+            dp.write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                                "v": "1", "ua": "u"}), \
+                 mock.patch.object(W, "sync_shelf", return_value=shelf), \
+                 mock.patch.object(W, "http_json", side_effect=fake_http), \
+                 mock.patch.object(W.time, "sleep"):
+                W.cmd_review(ns(decisions=str(dp)))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["bookIds"], ["2"])
 
 
 if __name__ == "__main__":

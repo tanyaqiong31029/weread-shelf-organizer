@@ -6,7 +6,7 @@ weread-shelf-organizer — 微信读书书架自动整理核心脚本
 子命令:
   creds                              提取并验证本机微信读书 Mac 客户端凭据
   sync [-o out.json]                 同步书架快照 (书籍/分组/专辑)
-  plan  --rules R.json [--baseline B.csv] [--full] [-o plan.json]
+  plan  --rules R.json [--baseline B.csv] [--reorganize --source-group "..."] [-o plan.json]
                                      生成整理计划 (自动分类 + 待复核清单)
   apply --plan P.json                批量执行迁移并核验
   review --decisions D.json          应用人工/AI 复核定类并核验
@@ -231,19 +231,36 @@ def cmd_plan(args):
     books = {b["bookId"]: b for b in shelf.get("books", [])}
     aid, in_target, in_custom = split_groups(shelf, group_names)
 
-    baseline = load_baseline(args.baseline) if args.baseline else {}
-    todo = [b for bid, b in books.items()
-            if bid not in in_target and not any(bid in v for v in in_custom.values())]
+    # 重组模式: 仅显式白名单里的来源分组允许重新归组, 其他分组一律不动
+    source_groups = []
+    if args.reorganize:
+        source_groups = [s.strip() for s in (args.source_group or "").split(",") if s.strip()]
+        for s in [x for x in source_groups if x not in in_custom]:
+            log(f"⚠️ 来源分组不存在(或非自定义分组): {s}")
+        source_groups = [s for s in source_groups if s in in_custom]
+        if not source_groups:
+            log("⚠️ --reorganize 未提供有效 --source-group 白名单, 本次仅整理未分组书")
+    source_snapshot = {s: sorted(in_custom[s]) for s in source_groups}
 
-    stats, moves, review = Counter(), [], []
-    for b in todo:
-        bid = b["bookId"]
-        # 计算当前所在分组名
-        from_group = None
+    def current_group(bid):
         for a in shelf.get("archive", []):
             if bid in a.get("bookIds", []) and a["name"] != "归档":
-                from_group = a["name"]
-                break
+                return a["name"]
+        return None
+
+    todo = []
+    for bid, b in books.items():
+        g = current_group(bid)
+        if g is None or (args.reorganize and g in source_groups):
+            todo.append((b, g))
+    n_src = sum(1 for _, g in todo if g is not None)
+    log(f"待整理: 未分组 {len(todo) - n_src} 本"
+        + (f" + 白名单来源分组 {n_src} 本" if args.reorganize else ""))
+
+    baseline = load_baseline(args.baseline) if args.baseline else {}
+    stats, moves, review = Counter(), [], []
+    for b, from_group in todo:
+        bid = b["bookId"]
         if bid in baseline:
             g = baseline[bid]
             if g not in group_names:
@@ -267,10 +284,11 @@ def cmd_plan(args):
                 review.append(item)
 
     plan = {"generated_at": datetime.now().isoformat(timespec="seconds"),
-            "mode": "full" if args.full else "incremental",
-            "total_books": len(books), "ungrouped": len(todo),
+            "mode": "reorganize" if args.reorganize else "incremental",
+            "total_books": len(books), "ungrouped": len(todo) - n_src,
             "moves": moves, "review": review,
             "skipped_custom_groups": {g: len(ids) for g, ids in in_custom.items()},
+            "source_snapshot": source_snapshot,
             "group_archive_ids": {g: aid.get(g) for g in group_names if aid.get(g)},
             "missing_groups": [g for g in group_names if not aid.get(g)]}
     out = args.output or "shelf_plan.json"
@@ -343,6 +361,22 @@ def _verify(hdrs, expected):
     return [(b, g, actual.get(b)) for b, g in expected.items() if actual.get(b) != g]
 
 
+def snapshot_current(shelf):
+    """书架 → {bookId: 当前分组名}(未分组不出现在映射中)"""
+    actual = {}
+    for a in shelf.get("archive", []):
+        for bid in a.get("bookIds", []):
+            actual[bid] = a["name"]
+    return actual
+
+
+def plan_age_hours(plan):
+    try:
+        return (time.time() - datetime.fromisoformat(plan["generated_at"]).timestamp()) / 3600
+    except Exception:
+        return 0.0
+
+
 def cmd_apply(args):
     with open(args.plan, encoding="utf-8") as f:
         plan = json.load(f)
@@ -350,13 +384,38 @@ def cmd_apply(args):
     if args.dry_run:
         log(f"[DRY-RUN] 将迁移 {len(plan['moves'])} 本")
         return
-    by_group = {}
+    if plan_age_hours(plan) > 24:
+        log("⚠️ 计划已生成超过 24 小时, 建议重新 plan 以获取最新书架状态")
+    # 执行前重新同步, 逐本校验「当前分组 == 计划记录的来源」——
+    # 防止计划过期或被篡改后绕过「只动未分组/白名单分组」的安全线
+    shelf = sync_shelf(hdrs)
+    aid = {a["name"]: a["archiveId"] for a in shelf.get("archive", [])}
+    actual = snapshot_current(shelf)
+    valid, stale = [], []
     for m in plan["moves"]:
+        now = actual.get(m["bookId"])
+        if now != m.get("from"):
+            stale.append((m, now))
+        else:
+            valid.append(m)
+    for m, now in stale[:10]:
+        log(f"  ⏭️ 状态已变, 跳过: {m.get('title', '')[:20]} | "
+            f"计划来源={m.get('from') or '未分组'} → 当前={now or '未分组'}")
+    if stale:
+        log(f"共 {len(stale)} 条计划因书架状态变化被跳过")
+    group_sourced = [m for m in valid if m.get("from")]
+    if group_sourced and not args.yes:
+        log(f"⚠️ 计划含 {len(group_sourced)} 本来自已有分组的书(重组迁移)。"
+            f"请人工复核 plan.json 后加 --yes 执行。")
+        sys.exit(3)
+    by_group = {}
+    for m in valid:
         by_group.setdefault(m["to"], []).append(m["bookId"])
-    moved, failed = _do_moves(hdrs, by_group, plan["group_archive_ids"])
-    expected = {m["bookId"]: m["to"] for m in plan["moves"]}
+    moved, failed = _do_moves(hdrs, by_group, aid)
+    expected = {m["bookId"]: m["to"] for m in valid}
     wrong = _verify(hdrs, {b: expected[b] for b in moved})
-    log(f"迁移完成: 成功 {len(moved)} 本, 失败 {len(failed)} 本, 核验错位 {len(wrong)} 本")
+    log(f"迁移完成: 成功 {len(moved)} 本, 失败 {len(failed)} 本, "
+        f"跳过状态不符 {len(stale)} 本, 核验错位 {len(wrong)} 本")
     for b, want, got in wrong[:10]:
         log(f"  ⚠️ {b[:8]} 期望「{want}」实际「{got}」")
 
@@ -367,17 +426,32 @@ def cmd_review(args):
     hdrs = headers(get_cred())
     shelf = sync_shelf(hdrs)
     aid = {a["name"]: a["archiveId"] for a in shelf.get("archive", [])}
-    by_group = {}
+    actual = snapshot_current(shelf)
+    # 状态校验: 决定可携带 from(来源分组, 缺省视为未分组), 当前状态不符则跳过
+    kept, skipped = [], 0
     for d in decisions:
+        exp = d.get("from")
+        now = actual.get(str(d["bookId"]))
+        if now != exp:
+            skipped += 1
+            log(f"  ⏭️ 状态不符, 跳过: {d.get('title') or d['bookId']} | "
+                f"预期来源={exp or '未分组'} → 当前={now or '未分组'}")
+            continue
+        kept.append(d)
+    if skipped:
+        log(f"共 {skipped} 条复核决定因状态不符被跳过")
+    by_group = {}
+    for d in kept:
         g = d["group"]
         if g not in aid:
             log(f"❌ 未知分组「{g}」, 跳过 {d.get('bookId')}")
             continue
         by_group.setdefault(g, []).append(str(d["bookId"]))
     moved, failed = _do_moves(hdrs, by_group, aid)
-    expected = {str(d["bookId"]): d["group"] for d in decisions}
+    expected = {str(d["bookId"]): d["group"] for d in kept}
     wrong = _verify(hdrs, {b: expected[b] for b in moved})
-    log(f"复核应用完成: 移动 {len(moved)} 本, 失败 {len(failed)}, 核验错位 {len(wrong)}")
+    log(f"复核应用完成: 移动 {len(moved)} 本, 失败 {len(failed)}, "
+        f"跳过状态不符 {skipped}, 核验错位 {len(wrong)}")
     for b, want, got in wrong[:10]:
         log(f"  ⚠️ {b[:8]} 期望「{want}」实际「{got}」")
 
@@ -451,11 +525,16 @@ def main():
     p = sub.add_parser("plan", parents=[common], help="生成整理计划")
     p.add_argument("--rules", required=True, help="分组与分类映射规则 JSON")
     p.add_argument("--baseline", help="基线 CSV (bookId,target_group)")
-    p.add_argument("--full", action="store_true", help="全量模式(忽略增量语义, 仅影响标记)")
+    p.add_argument("--reorganize", action="store_true",
+                   help="重组模式: 允许迁移 --source-group 白名单分组内的书")
+    p.add_argument("--source-group", default="",
+                   help='重组来源分组白名单, 逗号分隔, 如 "旧榜单A,旧榜单B"')
     p.add_argument("-o", "--output", default="shelf_plan.json")
 
     p = sub.add_parser("apply", parents=[common], help="执行计划迁移")
     p.add_argument("--plan", required=True)
+    p.add_argument("--yes", action="store_true",
+                   help="确认执行含「来自已有分组」书籍的重组迁移")
 
     p = sub.add_parser("review", help="应用复核定类")
     p.add_argument("--decisions", required=True, help='JSON: [{"bookId":"..","group":".."}]')
