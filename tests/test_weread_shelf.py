@@ -453,5 +453,48 @@ class ReviewSafetyTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
+class ArchiveGroupTests(unittest.TestCase):
+    """回归: 系统分组「归档」是未分组书的承载容器, 必须视同未分组。"""
+
+    def test_snapshot_current_ignores_archive(self):
+        shelf = {"archive": [
+            {"name": "归档", "archiveId": 1, "bookIds": ["9"]},
+            {"name": "03 商业经济", "archiveId": 303, "bookIds": ["1"]},
+        ]}
+        actual = W.snapshot_current(shelf)
+        self.assertNotIn("9", actual)   # 归档内 = 未分组
+        self.assertEqual(actual.get("1"), "03 商业经济")
+
+    def test_apply_treats_archived_as_ungrouped(self):
+        """计划时未分组、执行时进了「归档」的书, 仍应正常迁移。"""
+        plan = {"generated_at": datetime.now().isoformat(timespec="seconds"),
+                "mode": "incremental", "total_books": 1, "ungrouped": 1,
+                "moves": [{"bookId": "9", "title": "归档书", "from": None,
+                           "to": "01 成长学习", "basis": "t", "confidence": 1.0}],
+                "review": [], "skipped_custom_groups": {}, "source_snapshot": {},
+                "group_archive_ids": {"01 成长学习": 101}, "missing_groups": []}
+        with tempfile.TemporaryDirectory() as d:
+            pp = Path(d) / "p.json"
+            pp.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+            fs = FakeShelf({"归档": (1, ["9"]), "01 成长学习": (101, [])})
+            calls = []
+
+            def fake_http(url, payload=None, hdrs=None, timeout=30):
+                calls.append(payload)
+                if payload and "bookIds" in payload:
+                    fs.apply_move(payload["bookIds"], payload["name"])
+                return {"succ": 1}
+
+            with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                                "v": "1", "ua": "u"}), \
+                 mock.patch.object(W, "sync_shelf", side_effect=lambda *a, **k: fs.shelf()), \
+                 mock.patch.object(W, "http_json", side_effect=fake_http), \
+                 mock.patch.object(W.time, "sleep"):
+                W.cmd_apply(ns(plan=str(pp), dry_run=False, yes=False, json_report=None))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["bookIds"], ["9"])
+        self.assertEqual(fs.g["01 成长学习"]["ids"], ["9"])
+
+
 if __name__ == "__main__":
     unittest.main()

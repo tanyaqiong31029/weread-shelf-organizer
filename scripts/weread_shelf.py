@@ -362,9 +362,14 @@ def _verify(hdrs, expected):
 
 
 def snapshot_current(shelf):
-    """书架 → {bookId: 当前分组名}(未分组不出现在映射中)"""
+    """书架 → {bookId: 当前分组名}(未分组不出现在映射中)。
+
+    系统分组「归档」(archiveId=1) 是客户端对未分组书的承载容器, 视同未分组。
+    """
     actual = {}
     for a in shelf.get("archive", []):
+        if a["name"] == "归档":
+            continue
         for bid in a.get("bookIds", []):
             actual[bid] = a["name"]
     return actual
