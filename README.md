@@ -101,7 +101,7 @@ python3 weread_shelf.py apply --plan plan.json --yes --json-report report.json
 python3 -m unittest discover -s tests -v
 ```
 
-26 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
+28 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
 含待复核书的端到端 plan、置信度阈值分流、正确分组核验、重组白名单边界、执行前状态校验、
 核验失败非零退出、`--json-report` 结构化报告、环境变量凭据、批次切分、基线解析等。
 推送后由 GitHub Actions 自动执行。
