@@ -1,0 +1,18 @@
+# 工程规范配置：仅含 lint/类型检查配置节，本仓库是标准库零依赖脚本，不作为包构建/安装。
+[tool.ruff]
+line-length = 100
+target-version = "py311" # 与 CI(.github/workflows/test.yml) 的 Python 版本一致
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试文件保持原样：
+#   N812   — `import weread_shelf as W` 短别名贯穿全文件，重命名属无谓改动
+#   SIM117 — mock 上下文与 assertRaises 的嵌套 with 为既定结构，改写属逻辑级重构
+"tests/*" = ["N812", "SIM117"]
+
+# ---- 类型检查（宽松档：标准库动态脚本，不做 strict 约束）----
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

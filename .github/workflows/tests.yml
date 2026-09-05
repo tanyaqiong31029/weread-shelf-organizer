@@ -1,0 +1,39 @@
+# 工程规范 CI：密钥扫描 + lint/format/类型检查。
+# 既有单测工作流见同目录 test.yml（unittest），本文件不与其合并、互不影响。
+name: code-quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Gitleaks（防密扫描，全量历史）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lint:
+    name: Ruff + Mypy（静态检查）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Ruff lint
+        run: uvx ruff check .
+      - name: Ruff format 校验
+        run: uvx ruff format --check .
+      - name: Mypy 类型检查（宽松档）
+        run: uvx mypy .

@@ -1,0 +1,27 @@
+# 本地提交安检（Python 侧）：
+#   - 文件卫生：行尾空白 / 文件末尾换行 / YAML/TOML 语法 / 合并冲突标记 / 私钥
+#   - ruff：lint --fix 与 format（与 CI、pyproject.toml 同一套规则）
+#   - gitleaks：staged 内容密钥扫描（与 CI 的 gitleaks job 双保险）
+# 全量历史扫描由 .github/workflows/tests.yml 的 gitleaks job 负责。
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks

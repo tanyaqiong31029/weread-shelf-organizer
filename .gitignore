@@ -6,3 +6,11 @@ decisions.json
 needs_review.json
 output/
 .DS_Store
+
+# 工程规范工具缓存
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+*.db
+.env
