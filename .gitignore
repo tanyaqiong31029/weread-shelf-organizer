@@ -14,3 +14,4 @@ output/
 .coverage
 *.db
 .env
+scripts/plan.json
