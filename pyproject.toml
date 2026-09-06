@@ -1,4 +1,5 @@
-# 工程规范配置：仅含 lint/类型检查配置节，本仓库是标准库零依赖脚本，不作为包构建/安装。
+# 工程规范配置：包元数据 + lint/类型检查配置节。
+# 标准库零依赖; [project] 使其在各 Agent 环境中可 pip 安装与升级, 并提供 weread-shelf CLI。
 [tool.ruff]
 line-length = 100
 target-version = "py311" # 与 CI(.github/workflows/test.yml) 的 Python 版本一致
@@ -16,3 +17,30 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
+
+# ---- 包元数据（可安装、可升级）----
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weread-shelf-organizer"
+version = "1.2.0"
+description = "微信读书书架自动整理 Skill — 重组(白名单确认)/增量归类/分组管理/迁移核验"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "tanyaqiong31029" }]
+keywords = ["weread", "wechat-reading", "shelf", "agent-skill", "automation"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+weread-shelf = "weread_shelf:main"
+
+[tool.setuptools]
+package-dir = { "" = "scripts" }
+py-modules = ["weread_shelf"]
