@@ -101,10 +101,12 @@ python3 weread_shelf.py apply --plan plan.json --yes --json-report report.json
 python3 -m unittest discover -s tests -v
 ```
 
-28 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
+32 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
 含待复核书的端到端 plan、置信度阈值分流、正确分组核验、重组白名单边界、执行前状态校验、
 核验失败非零退出、`--json-report` 结构化报告、环境变量凭据、批次切分、基线解析等。
 推送后由 GitHub Actions 自动执行。
+
+完整安全重组流程见 [docs/walkthrough.md](docs/walkthrough.md)。
 
 **自动化集成**：`apply`/`review` 的退出码 — `0` 成功；`1` 存在迁移失败或核验错位；
 `2` 凭据失效；`3` 重组迁移未加 `--yes`。配合 `--json-report` 可获得结构化的

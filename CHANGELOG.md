@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 规范，版本号遵循语义化版本。
 
+## [1.2.0] - 2026-09-06
+
+### 新增
+- **网络层指数退避**: 429/5xx/网络超时按指数退避+抖动自动重试, 遵循 Retry-After;
+  其他 4xx 快速失败 (http_json 层, 全命令受益)
+- **审计标识**: plan 生成 plan_id 与 shelf_hash(计划时点归组状态哈希);
+  apply/review 每次执行生成 batch_id, 报告新增 batches 批次摘要
+- **pyproject 包元数据**: 可 pip 安装/升级, 提供 `weread-shelf` CLI 入口
+  (requires-python >=3.9, venv 实测通过)
+- **安全迁移演练文档**: docs/walkthrough.md 完整展示
+  plan --dry-run → 人工审阅 → apply --yes → verify 全流程
+
+### 变更
+- 批量迁移返回值增加批次摘要 (_do_moves → 三元组)
+
 ## [1.1.1] - 2026-09-02
 
 ### 修复

@@ -15,3 +15,5 @@ output/
 *.db
 .env
 scripts/plan.json
+build/
+*.egg-info/
