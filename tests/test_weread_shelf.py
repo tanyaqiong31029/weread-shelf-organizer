@@ -5,6 +5,7 @@
 """
 
 import argparse
+import io
 import json
 import sys
 import tempfile
@@ -14,6 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import urllib.error
+
 import weread_shelf as W  # noqa: E402
 
 RULES = {
@@ -245,17 +248,21 @@ class MoveTests(unittest.TestCase):
             mock.patch.object(W, "http_json", side_effect=fake_http),
             mock.patch.object(W.time, "sleep"),
         ):
-            moved, failed = W._do_moves({"v": "1"}, {"03 商业经济": ids}, aid)
+            moved, failed, batches = W._do_moves({"v": "1"}, {"03 商业经济": ids}, aid)
         self.assertEqual([len(c) for c in calls], [40, 15])
         self.assertEqual(len(moved), 55)
         self.assertEqual(failed, [])
+        self.assertEqual([b["books"] for b in batches], [40, 15])
+        self.assertTrue(all(b["ok"] for b in batches))
 
     def test_missing_group_not_moved(self):
         with mock.patch.object(W, "http_json") as hj, mock.patch.object(W.time, "sleep"):
-            moved, failed = W._do_moves({"v": "1"}, {"09 类型小说": ["1", "2"]}, {})
+            moved, failed, batches = W._do_moves(
+                {"v": "1"}, {"09 类型小说": ["1", "2"]}, {})
         hj.assert_not_called()
         self.assertEqual(moved, [])
         self.assertEqual(failed, ["1", "2"])
+        self.assertEqual(batches[0]["reason"], "group_missing")
 
 
 class BaselineTests(unittest.TestCase):
@@ -584,6 +591,70 @@ class ArchiveGroupTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["bookIds"], ["9"])
         self.assertEqual(fs.g["01 成长学习"]["ids"], ["9"])
+
+class HttpBackoffTests(unittest.TestCase):
+    """回归: 429/5xx/网络超时按指数退避重试; 其他 4xx 快速失败; 遵循 Retry-After。"""
+
+    class FakeResp:
+        def __init__(self, obj):
+            self.obj = obj
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(self.obj).encode()
+
+    def _ok(self, obj=None):
+        obj = obj or {"succ": 1}
+        return self.FakeResp(obj)
+
+    def _err(self, code, headers=None):
+        return urllib.error.HTTPError("u", code, "e", headers or {}, io.BytesIO(b""))
+
+    def test_429_then_503_then_success(self):
+        responses = [self._err(429), self._err(503), self._ok()]
+        sleeps = []
+        with mock.patch("urllib.request.urlopen", side_effect=responses), \
+             mock.patch.object(W.time, "sleep", side_effect=sleeps.append):
+            out = W.http_json("https://x/", hdrs={})
+        self.assertEqual(out, {"succ": 1})
+        self.assertEqual(len(sleeps), 2)
+        self.assertLess(sleeps[0], sleeps[1])          # 指数增长
+
+    def test_retry_after_header_respected(self):
+        sleeps = []
+        ra = mock.Mock()
+        ra.get = mock.Mock(return_value="7")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[self._err(429, ra), self._ok()]), \
+             mock.patch.object(W.time, "sleep", side_effect=sleeps.append):
+            W.http_json("https://x/", hdrs={})
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 7.0)        # 遵循 Retry-After
+
+    def test_permanent_4xx_fails_fast(self):
+        calls = []
+
+        def urlopen(req, timeout=30):
+            calls.append(1)
+            raise self._err(400)
+
+        with mock.patch("urllib.request.urlopen", side_effect=urlopen), \
+             mock.patch.object(W.time, "sleep"):
+            with self.assertRaises(urllib.error.HTTPError):
+                W.http_json("https://x/", hdrs={})
+        self.assertEqual(len(calls), 1)                # 不重试
+
+    def test_transient_exhaustion_raises(self):
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[self._err(503)] * 3), \
+             mock.patch.object(W.time, "sleep"):
+            with self.assertRaises(urllib.error.HTTPError):
+                W.http_json("https://x/", hdrs={}, retries=2)
 
 
 if __name__ == "__main__":

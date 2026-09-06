@@ -24,15 +24,19 @@ weread-shelf-organizer — 微信读书书架自动整理核心脚本
 """
 
 import argparse
+import contextlib
 import csv
+import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -92,13 +96,41 @@ def headers(cred):
     }
 
 
-def http_json(url, payload=None, hdrs=None, timeout=30):
+_TRANSIENT_CODES = {429, 500, 502, 503, 504}
+
+
+def _backoff_sleep(attempt, retry_after=None):
+    """指数退避 + 随机抖动; 有 Retry-After 时优先遵循。attempt 从 0 起。"""
+    delay = min(1.5 * (2**attempt) + random.uniform(0, 0.5), 30.0)
+    if retry_after:
+        with contextlib.suppress(ValueError):
+            delay = max(delay, float(retry_after))
+    log(f"  ⏳ 退避 {delay:.1f}s 后重试 ({attempt + 1})")
+    time.sleep(delay)
+
+
+def http_json(url, payload=None, hdrs=None, timeout=30, retries=2):
+    """GET/POST JSON。对 429/5xx/网络超时做指数退避重试; 其他 4xx 快速失败。"""
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url, data=data, method="POST" if data else "GET", headers=hdrs or {}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    last_err = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            url, data=data, method="POST" if data else "GET", headers=hdrs or {}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in _TRANSIENT_CODES or attempt == retries:
+                raise
+            last_err = e
+            _backoff_sleep(attempt, e.headers.get("Retry-After") if e.headers else None)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt == retries:
+                raise
+            last_err = e
+            _backoff_sleep(attempt)
+    raise last_err  # pragma: no cover
 
 
 def _mask(vid):
@@ -349,6 +381,19 @@ def cmd_plan(args):
         "group_archive_ids": {g: aid.get(g) for g in group_names if aid.get(g)},
         "missing_groups": [g for g in group_names if not aid.get(g)],
     }
+    # 审计标识: plan_id 唯一确定一份计划; shelf_hash 记录计划时点书架归组状态
+    membership = sorted(
+        (bid, a["name"]) for a in shelf.get("archive", []) for bid in a.get("bookIds", [])
+    )
+    plan["shelf_hash"] = hashlib.sha1(
+        json.dumps(membership, ensure_ascii=False).encode()
+    ).hexdigest()[:12]
+    plan["plan_id"] = hashlib.sha1(
+        (
+            plan["generated_at"]
+            + json.dumps([[m["bookId"], m["to"]] for m in plan["moves"]], ensure_ascii=False)
+        ).encode()
+    ).hexdigest()[:12]
     out = args.output or "shelf_plan.json"
     Path(out).write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
     log(
@@ -375,38 +420,42 @@ def _move_batch(hdrs, ids, gid, gname):
             if resp.get("succ") == 1:
                 return True
             log(f"  ⚠️ 异常响应 {resp}, 重试 {attempt + 1}/3")
-            time.sleep(2)
+            _backoff_sleep(attempt)
         except urllib.error.HTTPError as e:
             body = e.read()[:120]
             log(f"  ⚠️ HTTP {e.code}: {body}, 重试 {attempt + 1}/3")
             if e.code == 401:
                 print("FATAL: 凭据失效, 重新运行以刷新", file=sys.stderr)
                 sys.exit(2)
-            time.sleep(2 + attempt * 2)
+            _backoff_sleep(attempt)
         except Exception as e:
             log(f"  ⚠️ {e}, 重试 {attempt + 1}/3")
-            time.sleep(2)
+            _backoff_sleep(attempt)
     return False
 
 
 def _do_moves(hdrs, by_group, aid):
-    moved, failed = [], []
+    moved, failed, batches = [], [], []
     for g, ids in sorted(by_group.items()):
         gid = aid.get(g)
         if not gid:
             log(f"❌ 分组不存在: {g} ({len(ids)} 本未移动), 先用 groups --create 创建")
             failed.extend(ids)
+            batches.append({"group": g, "books": len(ids), "ok": False,
+                            "reason": "group_missing"})
             continue
         for i in range(0, len(ids), BATCH):
             chunk = ids[i : i + BATCH]
-            if _move_batch(hdrs, chunk, gid, g):
+            ok = _move_batch(hdrs, chunk, gid, g)
+            batches.append({"group": g, "books": len(chunk), "ok": ok})
+            if ok:
                 moved.extend(chunk)
                 log(f"{g} +{len(chunk)} (累计 {len(moved)})")
             else:
                 failed.extend(chunk)
                 log(f"  ❌ 批次失败 {len(chunk)} 本")
             time.sleep(0.4)
-    return moved, failed
+    return moved, failed, batches
 
 
 def _verify(hdrs, expected):
@@ -484,10 +533,12 @@ def cmd_apply(args):
             f"请人工复核 plan.json 后加 --yes 执行。"
         )
         sys.exit(3)
+    batch_id = uuid.uuid4().hex[:8]
+    log(f"批次 {batch_id} 开始 ({len(valid)} 本)")
     by_group = {}
     for m in valid:
         by_group.setdefault(m["to"], []).append(m["bookId"])
-    moved, failed = _do_moves(hdrs, by_group, aid)
+    moved, failed, batches = _do_moves(hdrs, by_group, aid)
     expected = {m["bookId"]: m["to"] for m in valid}
     wrong = _verify(hdrs, {b: expected[b] for b in moved})
     log(
@@ -502,8 +553,11 @@ def cmd_apply(args):
             {
                 "command": "apply",
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "plan_id": plan.get("plan_id"),
+                "batch_id": batch_id,
                 "planned": len(plan["moves"]),
                 "moved": sorted(moved),
+                "batches": batches,
                 "failed": sorted(failed),
                 "stale": [
                     {"bookId": m["bookId"], "planned_from": m.get("from"), "actual_group": now}
@@ -546,7 +600,9 @@ def cmd_review(args):
             log(f"❌ 未知分组「{g}」, 跳过 {d.get('bookId')}")
             continue
         by_group.setdefault(g, []).append(str(d["bookId"]))
-    moved, failed = _do_moves(hdrs, by_group, aid)
+    batch_id = uuid.uuid4().hex[:8]
+    log(f"批次 {batch_id} 开始 ({len(kept)} 本)")
+    moved, failed, batches = _do_moves(hdrs, by_group, aid)
     expected = {str(d["bookId"]): d["group"] for d in kept}
     wrong = _verify(hdrs, {b: expected[b] for b in moved})
     log(
@@ -561,7 +617,9 @@ def cmd_review(args):
             {
                 "command": "review",
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "batch_id": batch_id,
                 "planned": len(decisions),
+                "batches": batches,
                 "moved": sorted(moved),
                 "failed": sorted(failed),
                 "stale": skipped,
