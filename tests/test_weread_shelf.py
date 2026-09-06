@@ -264,6 +264,23 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(failed, ["1", "2"])
         self.assertEqual(batches[0]["reason"], "group_missing")
 
+    def test_failed_batch_records_api_error_summary(self):
+        """批次失败时, 批次摘要必须带上 API 响应错误摘要。"""
+
+        def fake_http(url, payload=None, hdrs=None, timeout=30):
+            return {"errcode": -2014, "errmsg": "请求过于频繁"}
+
+        with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
+                                                            "v": "1", "ua": "u"}), \
+             mock.patch.object(W, "http_json", side_effect=fake_http), \
+             mock.patch.object(W.time, "sleep"):
+            moved, failed, batches = W._do_moves(
+                {"v": "1"}, {"09 类型小说": ["1", "2"]}, {"09 类型小说": 9})
+        self.assertEqual(failed, ["1", "2"])
+        self.assertFalse(batches[0]["ok"])
+        self.assertIn("-2014", batches[0]["error"])
+        self.assertIn("请求过于频繁", batches[0]["error"])
+
 
 class BaselineTests(unittest.TestCase):
     def test_load_baseline_bom_and_spaces(self):

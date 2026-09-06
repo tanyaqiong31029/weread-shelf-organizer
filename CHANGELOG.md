@@ -8,7 +8,7 @@
 - **网络层指数退避**: 429/5xx/网络超时按指数退避+抖动自动重试, 遵循 Retry-After;
   其他 4xx 快速失败 (http_json 层, 全命令受益)
 - **审计标识**: plan 生成 plan_id 与 shelf_hash(计划时点归组状态哈希);
-  apply/review 每次执行生成 batch_id, 报告新增 batches 批次摘要
+  apply/review 每次执行生成 batch_id, 报告新增 batches 批次摘要(失败批次含 API 响应错误摘要)
 - **pyproject 包元数据**: 可 pip 安装/升级, 提供 `weread-shelf` CLI 入口
   (requires-python >=3.9, venv 实测通过)
 - **安全迁移演练文档**: docs/walkthrough.md 完整展示

@@ -410,6 +410,8 @@ def cmd_plan(args):
 
 
 def _move_batch(hdrs, ids, gid, gname):
+    """单批迁移; 返回 (是否成功, 失败原因摘要) — 摘要进入审计报告。"""
+    detail = "unknown"
     for attempt in range(3):
         try:
             resp = http_json(
@@ -418,20 +420,23 @@ def _move_batch(hdrs, ids, gid, gname):
                 hdrs,
             )
             if resp.get("succ") == 1:
-                return True
+                return True, ""
+            detail = f"resp={json.dumps(resp, ensure_ascii=False)[:160]}"
             log(f"  ⚠️ 异常响应 {resp}, 重试 {attempt + 1}/3")
             _backoff_sleep(attempt)
         except urllib.error.HTTPError as e:
             body = e.read()[:120]
-            log(f"  ⚠️ HTTP {e.code}: {body}, 重试 {attempt + 1}/3")
+            detail = f"HTTP {e.code}: {body}"
+            log(f"  ⚠️ {detail}, 重试 {attempt + 1}/3")
             if e.code == 401:
                 print("FATAL: 凭据失效, 重新运行以刷新", file=sys.stderr)
                 sys.exit(2)
             _backoff_sleep(attempt)
         except Exception as e:
-            log(f"  ⚠️ {e}, 重试 {attempt + 1}/3")
+            detail = f"{type(e).__name__}: {e}"
+            log(f"  ⚠️ {detail}, 重试 {attempt + 1}/3")
             _backoff_sleep(attempt)
-    return False
+    return False, detail
 
 
 def _do_moves(hdrs, by_group, aid):
@@ -446,8 +451,11 @@ def _do_moves(hdrs, by_group, aid):
             continue
         for i in range(0, len(ids), BATCH):
             chunk = ids[i : i + BATCH]
-            ok = _move_batch(hdrs, chunk, gid, g)
-            batches.append({"group": g, "books": len(chunk), "ok": ok})
+            ok, err = _move_batch(hdrs, chunk, gid, g)
+            entry = {"group": g, "books": len(chunk), "ok": ok}
+            if not ok:
+                entry["error"] = err
+            batches.append(entry)
             if ok:
                 moved.extend(chunk)
                 log(f"{g} +{len(chunk)} (累计 {len(moved)})")

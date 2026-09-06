@@ -62,6 +62,16 @@ git clone https://github.com/tanyaqiong31029/weread-shelf-organizer.git \
 ### 3. 手动使用（不用 Agent 也行）
 
 ```bash
+# 方式 A: pip 安装（提供 weread-shelf 全局命令, requires-python >= 3.9）
+pip install git+https://github.com/tanyaqiong31029/weread-shelf-organizer.git
+
+weread-shelf creds
+weread-shelf plan --rules examples/rules.example.json -o plan.json --dry-run
+weread-shelf apply --plan plan.json
+```
+
+```bash
+# 方式 B: 克隆后从 scripts 目录运行
 cd scripts
 
 python3 weread_shelf.py creds                    # 验证凭据（自动启动客户端）
