@@ -257,8 +257,7 @@ class MoveTests(unittest.TestCase):
 
     def test_missing_group_not_moved(self):
         with mock.patch.object(W, "http_json") as hj, mock.patch.object(W.time, "sleep"):
-            moved, failed, batches = W._do_moves(
-                {"v": "1"}, {"09 类型小说": ["1", "2"]}, {})
+            moved, failed, batches = W._do_moves({"v": "1"}, {"09 类型小说": ["1", "2"]}, {})
         hj.assert_not_called()
         self.assertEqual(moved, [])
         self.assertEqual(failed, ["1", "2"])
@@ -270,12 +269,16 @@ class MoveTests(unittest.TestCase):
         def fake_http(url, payload=None, hdrs=None, timeout=30):
             return {"errcode": -2014, "errmsg": "请求过于频繁"}
 
-        with mock.patch.object(W, "get_cred", return_value={"vid": "1", "skey": "s",
-                                                            "v": "1", "ua": "u"}), \
-             mock.patch.object(W, "http_json", side_effect=fake_http), \
-             mock.patch.object(W.time, "sleep"):
+        with (
+            mock.patch.object(
+                W, "get_cred", return_value={"vid": "1", "skey": "s", "v": "1", "ua": "u"}
+            ),
+            mock.patch.object(W, "http_json", side_effect=fake_http),
+            mock.patch.object(W.time, "sleep"),
+        ):
             moved, failed, batches = W._do_moves(
-                {"v": "1"}, {"09 类型小说": ["1", "2"]}, {"09 类型小说": 9})
+                {"v": "1"}, {"09 类型小说": ["1", "2"]}, {"09 类型小说": 9}
+            )
         self.assertEqual(failed, ["1", "2"])
         self.assertFalse(batches[0]["ok"])
         self.assertIn("-2014", batches[0]["error"])
@@ -496,7 +499,7 @@ class ApplySafetyTests(unittest.TestCase):
 class ReviewSafetyTests(unittest.TestCase):
     """安全回归: review 决定执行前校验当前分组状态, 核验失败非零退出。"""
 
-    def _run_review(self, decisions, groups, lie=False):
+    def _run_review(self, decisions, groups, lie=False, yes=False):
         fs = FakeShelf(groups)
         calls = []
 
@@ -517,7 +520,7 @@ class ReviewSafetyTests(unittest.TestCase):
                 mock.patch.object(W, "http_json", side_effect=fake_http),
                 mock.patch.object(W.time, "sleep"),
             ):
-                W.cmd_review(ns(decisions=str(dp), json_report=None))
+                W.cmd_review(ns(decisions=str(dp), json_report=None, yes=yes))
         return calls, fs
 
     def test_review_skips_mismatched_state(self):
@@ -528,10 +531,21 @@ class ReviewSafetyTests(unittest.TestCase):
         )
         self.assertEqual(calls, [])
 
+    def test_review_requires_yes_for_group_sourced(self):
+        """回归(评审8): review 移动「来自已有分组」的书必须 --yes, 与 apply 同规则。"""
+        with self.assertRaises(SystemExit) as cm:
+            self._run_review(
+                [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}],
+                {"03 商业经济": (303, []), "旧榜单A": (11, ["2"])},
+                yes=False,
+            )
+        self.assertEqual(cm.exception.code, 3)
+
     def test_review_moves_when_state_matches(self):
         calls, fs = self._run_review(
             [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}],
             {"03 商业经济": (303, []), "旧榜单A": (11, ["2"])},
+            yes=True,
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["bookIds"], ["2"])
@@ -543,6 +557,17 @@ class ReviewSafetyTests(unittest.TestCase):
                 [{"bookId": "2", "group": "03 商业经济", "from": "旧榜单A"}],
                 {"03 商业经济": (303, []), "旧榜单A": (11, ["2"])},
                 lie=True,
+                yes=True,
+            )
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_review_unknown_group_fails_nonzero(self):
+        """回归(评审8): 目标分组不存在必须计为失败并非零退出, 不能静默成功。"""
+        with self.assertRaises(SystemExit) as cm:
+            self._run_review(
+                [{"bookId": "2", "group": "不存在的组"}],
+                {"03 商业经济": (303, [])},
+                yes=True,
             )
         self.assertEqual(cm.exception.code, 1)
 
@@ -609,6 +634,7 @@ class ArchiveGroupTests(unittest.TestCase):
         self.assertEqual(calls[0]["bookIds"], ["9"])
         self.assertEqual(fs.g["01 成长学习"]["ids"], ["9"])
 
+
 class HttpBackoffTests(unittest.TestCase):
     """回归: 429/5xx/网络超时按指数退避重试; 其他 4xx 快速失败; 遵循 Retry-After。"""
 
@@ -635,23 +661,26 @@ class HttpBackoffTests(unittest.TestCase):
     def test_429_then_503_then_success(self):
         responses = [self._err(429), self._err(503), self._ok()]
         sleeps = []
-        with mock.patch("urllib.request.urlopen", side_effect=responses), \
-             mock.patch.object(W.time, "sleep", side_effect=sleeps.append):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=responses),
+            mock.patch.object(W.time, "sleep", side_effect=sleeps.append),
+        ):
             out = W.http_json("https://x/", hdrs={})
         self.assertEqual(out, {"succ": 1})
         self.assertEqual(len(sleeps), 2)
-        self.assertLess(sleeps[0], sleeps[1])          # 指数增长
+        self.assertLess(sleeps[0], sleeps[1])  # 指数增长
 
     def test_retry_after_header_respected(self):
         sleeps = []
         ra = mock.Mock()
         ra.get = mock.Mock(return_value="7")
-        with mock.patch("urllib.request.urlopen",
-                        side_effect=[self._err(429, ra), self._ok()]), \
-             mock.patch.object(W.time, "sleep", side_effect=sleeps.append):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=[self._err(429, ra), self._ok()]),
+            mock.patch.object(W.time, "sleep", side_effect=sleeps.append),
+        ):
             W.http_json("https://x/", hdrs={})
         self.assertEqual(len(sleeps), 1)
-        self.assertGreaterEqual(sleeps[0], 7.0)        # 遵循 Retry-After
+        self.assertGreaterEqual(sleeps[0], 7.0)  # 遵循 Retry-After
 
     def test_permanent_4xx_fails_fast(self):
         calls = []
@@ -660,16 +689,19 @@ class HttpBackoffTests(unittest.TestCase):
             calls.append(1)
             raise self._err(400)
 
-        with mock.patch("urllib.request.urlopen", side_effect=urlopen), \
-             mock.patch.object(W.time, "sleep"):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=urlopen),
+            mock.patch.object(W.time, "sleep"),
+        ):
             with self.assertRaises(urllib.error.HTTPError):
                 W.http_json("https://x/", hdrs={})
-        self.assertEqual(len(calls), 1)                # 不重试
+        self.assertEqual(len(calls), 1)  # 不重试
 
     def test_transient_exhaustion_raises(self):
-        with mock.patch("urllib.request.urlopen",
-                        side_effect=[self._err(503)] * 3), \
-             mock.patch.object(W.time, "sleep"):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=[self._err(503)] * 3),
+            mock.patch.object(W.time, "sleep"),
+        ):
             with self.assertRaises(urllib.error.HTTPError):
                 W.http_json("https://x/", hdrs={}, retries=2)
 

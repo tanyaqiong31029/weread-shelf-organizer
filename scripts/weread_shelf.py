@@ -99,6 +99,10 @@ def headers(cred):
 _TRANSIENT_CODES = {429, 500, 502, 503, 504}
 
 
+class CredentialsExpiredError(Exception):
+    """凭据失效(401): 携带已完成的批次进度, 由调用方写报告后以退出码 2 结束。"""
+
+
 def _backoff_sleep(attempt, retry_after=None):
     """指数退避 + 随机抖动; 有 Retry-After 时优先遵循。attempt 从 0 起。"""
     delay = min(1.5 * (2**attempt) + random.uniform(0, 0.5), 30.0)
@@ -429,8 +433,7 @@ def _move_batch(hdrs, ids, gid, gname):
             detail = f"HTTP {e.code}: {body}"
             log(f"  ⚠️ {detail}, 重试 {attempt + 1}/3")
             if e.code == 401:
-                print("FATAL: 凭据失效, 重新运行以刷新", file=sys.stderr)
-                sys.exit(2)
+                raise CredentialsExpiredError(detail) from e
             _backoff_sleep(attempt)
         except Exception as e:
             detail = f"{type(e).__name__}: {e}"
@@ -446,8 +449,7 @@ def _do_moves(hdrs, by_group, aid):
         if not gid:
             log(f"❌ 分组不存在: {g} ({len(ids)} 本未移动), 先用 groups --create 创建")
             failed.extend(ids)
-            batches.append({"group": g, "books": len(ids), "ok": False,
-                            "reason": "group_missing"})
+            batches.append({"group": g, "books": len(ids), "ok": False, "reason": "group_missing"})
             continue
         for i in range(0, len(ids), BATCH):
             chunk = ids[i : i + BATCH]
@@ -506,6 +508,13 @@ def _write_json_report(path, data):
     log(f"结构化报告 → {path}")
 
 
+def _require_yes_for_group_sourced(count, yes, entry="apply"):
+    """统一保护: 迁移「来自已有分组」的书必须显式 --yes (apply/review 同规则)。"""
+    if count and not yes:
+        log(f"⚠️ 计划含 {count} 本来自已有分组的书(重组迁移)。请人工复核后加 --yes 执行。")
+        sys.exit(3)
+
+
 def cmd_apply(args):
     with open(args.plan, encoding="utf-8") as f:
         plan = json.load(f)
@@ -535,18 +544,43 @@ def cmd_apply(args):
     if stale:
         log(f"共 {len(stale)} 条计划因书架状态变化被跳过")
     group_sourced = [m for m in valid if m.get("from")]
-    if group_sourced and not args.yes:
-        log(
-            f"⚠️ 计划含 {len(group_sourced)} 本来自已有分组的书(重组迁移)。"
-            f"请人工复核 plan.json 后加 --yes 执行。"
-        )
-        sys.exit(3)
+    _require_yes_for_group_sourced(len(group_sourced), args.yes, entry="apply")
     batch_id = uuid.uuid4().hex[:8]
     log(f"批次 {batch_id} 开始 ({len(valid)} 本)")
     by_group = {}
     for m in valid:
         by_group.setdefault(m["to"], []).append(m["bookId"])
-    moved, failed, batches = _do_moves(hdrs, by_group, aid)
+    pending = [m["bookId"] for m in valid]
+    moved, failed, batches = [], [], []
+    try:
+        moved, failed, batches = _do_moves(hdrs, by_group, aid)
+    except CredentialsExpiredError as e:
+        attempted = {b for b in moved} | set(failed)
+        failed = list(dict.fromkeys(failed + [b for b in pending if b not in attempted]))
+        batches.append(
+            {"group": "*", "books": len(failed), "ok": False, "error": f"credentials_expired: {e}"}
+        )
+        _write_json_report(
+            args.json_report or "apply_interrupted.json",
+            {
+                "command": "apply",
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "plan_id": plan.get("plan_id"),
+                "batch_id": batch_id,
+                "interrupted": True,
+                "planned": len(plan["moves"]),
+                "moved": sorted(moved),
+                "failed": sorted(failed),
+                "stale": [
+                    {"bookId": m["bookId"], "planned_from": m.get("from"), "actual_group": now}
+                    for m, now in stale
+                ],
+                "wrong": [],
+                "batches": batches,
+            },
+        )
+        print("FATAL: 凭据失效, 进度已写入报告; 重新登录后重跑即可续传", file=sys.stderr)
+        sys.exit(2)
     expected = {m["bookId"]: m["to"] for m in valid}
     wrong = _verify(hdrs, {b: expected[b] for b in moved})
     log(
@@ -601,16 +635,52 @@ def cmd_review(args):
         kept.append(d)
     if skipped:
         log(f"共 {skipped} 条复核决定因状态不符被跳过")
+    group_sourced = [d for d in kept if d.get("from")]
+    _require_yes_for_group_sourced(len(group_sourced), args.yes, entry="review")
     by_group = {}
+    failed = []
     for d in kept:
         g = d["group"]
         if g not in aid:
-            log(f"❌ 未知分组「{g}」, 跳过 {d.get('bookId')}")
+            log(f"❌ 未知分组「{g}」, 计入失败: {d.get('bookId')}")
+            failed.append(str(d["bookId"]))
             continue
         by_group.setdefault(g, []).append(str(d["bookId"]))
     batch_id = uuid.uuid4().hex[:8]
     log(f"批次 {batch_id} 开始 ({len(kept)} 本)")
-    moved, failed, batches = _do_moves(hdrs, by_group, aid)
+    moved, move_failed, batches = [], [], []
+    try:
+        moved, move_failed, batches = _do_moves(hdrs, by_group, aid)
+    except CredentialsExpiredError as e:
+        attempted = {b for b in moved} | set(move_failed) | set(failed)
+        remaining = [str(d["bookId"]) for d in kept if str(d["bookId"]) not in attempted]
+        move_failed = list(dict.fromkeys(move_failed + remaining))
+        batches.append(
+            {
+                "group": "*",
+                "books": len(remaining),
+                "ok": False,
+                "error": f"credentials_expired: {e}",
+            }
+        )
+        _write_json_report(
+            args.json_report or "review_interrupted.json",
+            {
+                "command": "review",
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "batch_id": batch_id,
+                "interrupted": True,
+                "planned": len(decisions),
+                "moved": sorted(moved),
+                "failed": sorted(dict.fromkeys(failed + move_failed)),
+                "stale": skipped,
+                "wrong": [],
+                "batches": batches,
+            },
+        )
+        print("FATAL: 凭据失效, 进度已写入报告; 重新登录后重跑即可续传", file=sys.stderr)
+        sys.exit(2)
+    failed = list(dict.fromkeys(failed + move_failed))
     expected = {str(d["bookId"]): d["group"] for d in kept}
     wrong = _verify(hdrs, {b: expected[b] for b in moved})
     log(
@@ -737,6 +807,7 @@ def main():
     p.add_argument(
         "--decisions", required=True, help='JSON: [{"bookId":"..","group":"..","from":null}]'
     )
+    p.add_argument("--yes", action="store_true", help="确认执行含「来自已有分组」书籍的重组迁移")
     p.add_argument("--json-report", help="写入结构化结果 JSON (moved/failed/stale/wrong)")
 
     p = sub.add_parser("groups", help="分组管理")
