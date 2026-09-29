@@ -25,7 +25,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "weread-shelf-organizer"
-version = "1.2.0"
+version = "1.2.1"
 description = "微信读书书架自动整理 Skill — 重组(白名单确认)/增量归类/分组管理/迁移核验"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -111,7 +111,7 @@ python3 weread_shelf.py apply --plan plan.json --yes --json-report report.json
 python3 -m unittest discover -s tests -v
 ```
 
-32 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
+35 个离线回归测试（全 mock、无网络，有状态假书架模拟迁移后同步）：classify 元数一致性、
 含待复核书的端到端 plan、置信度阈值分流、正确分组核验、重组白名单边界、执行前状态校验、
 核验失败非零退出、`--json-report` 结构化报告、环境变量凭据、批次切分、基线解析等。
 推送后由 GitHub Actions 自动执行。
@@ -133,8 +133,8 @@ moved/failed/stale/wrong 结果，定时任务据此判断成败。
 ## ⚠️ 免责声明
 
 本项目调用微信读书客户端内部接口（非官方开放 API），接口可能随版本更新而变化。
-仅供学习与个人书架管理使用，请控制调用频率，勿用于任何商业用途或他人账号。
-使用本项目产生的任何后果由使用者自行承担。
+本项目按 [MIT](LICENSE) 许可开源（允许商用）；但接口非官方、账号风险自担，
+严禁用于批量注册、爬取、代练等滥用场景。使用产生的任何后果由使用者自行承担。
 
 ## License
 

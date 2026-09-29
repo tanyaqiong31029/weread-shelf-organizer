@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 规范，版本号遵循语义化版本。
 
+## [1.2.1] - 2026-09-06
+
+### 安全
+- **review 入口与 apply 同等保护**: 移动「来自已有分组」的书必须 --yes(退出码 3),
+  双入口共用确认校验, 消除保护差
+- **中断进度报告**: 凭据失效不再深处直接退出——抛 CredentialsExpiredError,
+  apply/review 捕获后把未尝试书籍计入 failed、写含 interrupted 标记的报告,
+  以退出码 2 结束; 重新登录后按报告精确续传
+- **review 未知目标分组**计入 failed 并非零退出(此前静默成功)
+
+### 工程
+- CI 固定 ruff@0.12.0 / mypy@1.17.1, 恢复 format 门禁; 测试 33 → 35 项
+- README 测试数更正、商用表述与 MIT 许可对齐; SECURITY 支持表升至 1.2.x
+
 ## [1.2.0] - 2026-09-06
 
 ### 新增
