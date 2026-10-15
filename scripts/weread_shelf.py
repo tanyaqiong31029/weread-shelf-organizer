@@ -9,7 +9,7 @@ weread-shelf-organizer — 微信读书书架自动整理核心脚本
                                      生成整理计划 (自动分类 + 待复核清单)
   apply --plan P.json                批量执行迁移并核验
   review --decisions D.json          应用人工/AI 复核定类并核验
-  groups --create NAME | --delete NAME [--purge-empty]
+  groups [--list] | --create NAME | --delete NAME [--force] | --purge-empty
                                      分组管理 (创建 / 删除空分组)
   verify --plan P.json               核验计划中的书是否已落位
 
@@ -60,8 +60,13 @@ def log(msg):
 # ---------------------------------------------------------------- 凭据
 def extract_cred():
     """启动 Mac 客户端, 从其本地日志提取 vid/skey(仅驻留内存)。"""
-    subprocess.run(["open", "-a", APP_NAME], capture_output=True)
-    time.sleep(8)
+    try:
+        subprocess.run(["open", "-a", APP_NAME], capture_output=True)
+    except OSError as e:
+        # 非 macOS 无 `open` 命令(FileNotFoundError): 不启动客户端, 仍尝试读取 WEREAD_LOG_DIR
+        log(f"无法启动微信读书客户端({type(e).__name__}), 仅尝试读取已有日志")
+    else:
+        time.sleep(8)
     logs = sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
     if not logs:
         return None
@@ -69,7 +74,7 @@ def extract_cred():
     skeys = re.findall(r'skey\s*=+\s*"([A-Za-z0-9_@!+-]{6,})"', text)
     skeys += re.findall(r"skey\s*=\s*([A-Za-z0-9_@!+-]{6,});", text)
     vids = re.findall(r"vid\s*=+\s*\"?(\d{6,12})\"?", text)
-    vers = re.findall(r'[vv]\s*=\s*"?(\d+\.\d+\.\d+(?:\.\d+)?)"?\s*;', text)
+    vers = re.findall(r'v\s*=\s*"?(\d+\.\d+\.\d+(?:\.\d+)?)"?\s*;', text)
     if not skeys or not vids:
         return None
     cred = {
@@ -160,6 +165,9 @@ def get_cred(retry=2):
             return cred
         except urllib.error.HTTPError as e:
             log(f"环境变量凭据无效(HTTP {e.code}), 回退到客户端日志提取")
+        except (OSError, ValueError) as e:
+            # URLError/超时/响应非 JSON: 不抛 traceback, 回退后统一以 FATAL + 退出码 2 结束
+            log(f"环境变量凭据校验失败({type(e).__name__}), 回退到客户端日志提取")
     # 路径 2: macOS 微信读书客户端日志 (自动启动客户端)
     for attempt in range(retry):
         cred = extract_cred()
@@ -172,10 +180,16 @@ def get_cred(retry=2):
                 return cred
             except urllib.error.HTTPError as e:
                 log(f"凭据无效(HTTP {e.code}), 重启客户端刷新登录 ({attempt + 1}/{retry})")
-                subprocess.run(["pkill", "-x", "WeRead"], capture_output=True)
+                with contextlib.suppress(OSError):
+                    subprocess.run(["pkill", "-x", "WeRead"], capture_output=True)
+                time.sleep(5)
+            except (OSError, ValueError) as e:
+                log(f"凭据校验失败({type(e).__name__}), 重试 ({attempt + 1}/{retry})")
                 time.sleep(5)
         else:
             log(f"日志中未找到凭据, 等待客户端启动 ({attempt + 1}/{retry})")
+            if sys.platform != "darwin":
+                break  # 非 macOS 无客户端可等待, 直接给出 FATAL
             time.sleep(8)
     print(
         "FATAL: 无法获取有效凭据。请打开微信读书 Mac 客户端并确认已登录"
@@ -442,8 +456,12 @@ def _move_batch(hdrs, ids, gid, gname):
     return False, detail
 
 
-def _do_moves(hdrs, by_group, aid):
-    moved, failed, batches = [], [], []
+def _do_moves(hdrs, by_group, aid, moved=None, failed=None, batches=None):
+    """逐批迁移。moved/failed/batches 可由调用方传入并就地追加:
+    凭据失效(CredentialsExpiredError)中断时, 调用方仍持有已完成批次的进度。"""
+    moved = [] if moved is None else moved
+    failed = [] if failed is None else failed
+    batches = [] if batches is None else batches
     for g, ids in sorted(by_group.items()):
         gid = aid.get(g)
         if not gid:
@@ -518,10 +536,11 @@ def _require_yes_for_group_sourced(count, yes, entry="apply"):
 def cmd_apply(args):
     with open(args.plan, encoding="utf-8") as f:
         plan = json.load(f)
-    hdrs = headers(get_cred())
     if args.dry_run:
+        # 仅回显计划条数, 无需凭据(不启动客户端、不发请求)
         log(f"[DRY-RUN] 将迁移 {len(plan['moves'])} 本")
         return
+    hdrs = headers(get_cred())
     if plan_age_hours(plan) > 24:
         log("⚠️ 计划已生成超过 24 小时, 建议重新 plan 以获取最新书架状态")
     # 执行前重新同步, 逐本校验「当前分组 == 计划记录的来源」——
@@ -553,7 +572,7 @@ def cmd_apply(args):
     pending = [m["bookId"] for m in valid]
     moved, failed, batches = [], [], []
     try:
-        moved, failed, batches = _do_moves(hdrs, by_group, aid)
+        _do_moves(hdrs, by_group, aid, moved, failed, batches)
     except CredentialsExpiredError as e:
         attempted = {b for b in moved} | set(failed)
         failed = list(dict.fromkeys(failed + [b for b in pending if b not in attempted]))
@@ -650,7 +669,7 @@ def cmd_review(args):
     log(f"批次 {batch_id} 开始 ({len(kept)} 本)")
     moved, move_failed, batches = [], [], []
     try:
-        moved, move_failed, batches = _do_moves(hdrs, by_group, aid)
+        _do_moves(hdrs, by_group, aid, moved, move_failed, batches)
     except CredentialsExpiredError as e:
         attempted = {b for b in moved} | set(move_failed) | set(failed)
         remaining = [str(d["bookId"]) for d in kept if str(d["bookId"]) not in attempted]
@@ -753,7 +772,7 @@ def cmd_groups(args):
                 n += 1
                 time.sleep(0.4)
         log(f"共清理 {n} 个空分组")
-    else:
+    else:  # --list, 或未指定其他操作时的默认行为
         for name, a in sorted(archives.items()):
             print(f"  {name}: {len(a.get('bookIds', []))} 本 (archiveId={a['archiveId']})")
 
@@ -815,7 +834,7 @@ def main():
     p.add_argument("--delete", help="删除分组(默认仅空分组)")
     p.add_argument("--force", action="store_true", help="允许删除非空分组(书保留在书架)")
     p.add_argument("--purge-empty", action="store_true", help="清理所有空分组")
-    p.add_argument("--list", action="store_true", help="列出全部分组")
+    p.add_argument("--list", action="store_true", help="列出全部分组(未指定其他操作时的默认行为)")
 
     p = sub.add_parser("verify", help="核验计划落位")
     p.add_argument("--plan", required=True)

@@ -3,13 +3,13 @@
 本仓库同时是已安装使用的 ZCode skill 与 GitHub 仓库。已接入工程化规范（pre-commit / ruff / mypy / gitleaks / CI）。AI agent 在本仓库工作时遵守以下约定。
 
 ## 项目概要
-微信读书书架自动整理 Skill（Python）：`SKILL.md`（skill 指令文件）、`scripts/weread_shelf.py`（驱动 macOS 微信读书客户端的主脚本）、`scripts/plan.json`、`tests/`、`references/`、`examples/`、`docs/`。
+微信读书书架自动整理 Skill（Python）：`SKILL.md`（skill 指令文件）、`scripts/weread_shelf.py`（驱动 macOS 微信读书客户端的主脚本）、`tests/`、`references/`、`examples/`、`docs/`。
 
 ## 常用命令
 ```bash
 uvx ruff check . && uvx ruff format --check .    # lint（保持 0 问题）
 uvx mypy .                                       # 类型检查（保持 0 错误）
-python3 -m unittest discover -s tests            # 28 个离线回归测试，必须全绿
+python3 -m unittest discover -s tests            # 44 个离线回归测试，必须全绿
 pre-commit run --all-files                       # 提交前全量自检
 ```
 

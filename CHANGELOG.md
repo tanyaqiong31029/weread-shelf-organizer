@@ -2,6 +2,19 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 规范，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+- **中断报告保留已完成批次**: 凭据失效时 apply/review 的报告此前 moved=0、全部记为 failed;
+  现 `_do_moves` 就地追加调用方传入的进度列表, 报告如实反映已完成批次
+- **跨平台凭据**: 非 macOS 无 `open` 命令不再抛 FileNotFoundError; 环境变量凭据校验遇
+  URLError/超时也不再 traceback, 统一以 FATAL + 退出码 2 结束
+- `apply --dry-run` 不再获取凭据/启动客户端; `groups --list` 帮助文本与行为对齐
+
+### 工程
+- 单测矩阵覆盖 Python 3.9 / 3.11 / 3.13; 测试 35 → 44 项
+- README pip 安装说明补充示例规则下载; AGENTS.md 去除不存在的 scripts/plan.json
+
 ## [1.2.1] - 2026-09-06
 
 ### 安全
