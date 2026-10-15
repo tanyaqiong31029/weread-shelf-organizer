@@ -706,5 +706,174 @@ class HttpBackoffTests(unittest.TestCase):
                 W.http_json("https://x/", hdrs={}, retries=2)
 
 
+CRED = {"vid": "1", "skey": "s", "v": "1", "ua": "u"}
+
+
+def _http_401_on(fail_names, fs, calls):
+    """假接口: 迁移到 fail_names 中的分组时返回 401(凭据失效), 其余正常落位。"""
+
+    def fake_http(url, payload=None, hdrs=None, timeout=30):
+        calls.append(payload)
+        if payload["name"] in fail_names:
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", None, io.BytesIO(b"expired"))
+        fs.apply_move(payload["bookIds"], payload["name"])
+        return {"succ": 1}
+
+    return fake_http
+
+
+class CredentialsExpiredProgressTests(unittest.TestCase):
+    """回归: 批次中途凭据失效(401)时, 中断报告必须保留已完成批次的进度。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_do_moves_keeps_progress_in_caller_lists(self):
+        fs = FakeShelf({"A": (1, []), "B": (2, [])})
+        calls = []
+        moved, failed, batches = [], [], []
+        with (
+            mock.patch.object(W, "http_json", side_effect=_http_401_on({"B"}, fs, calls)),
+            mock.patch.object(W.time, "sleep"),
+        ):
+            with self.assertRaises(W.CredentialsExpiredError):
+                W._do_moves(
+                    CRED, {"A": ["1", "2"], "B": ["3"]}, {"A": 1, "B": 2}, moved, failed, batches
+                )
+        self.assertEqual(moved, ["1", "2"])
+        self.assertEqual(failed, [])
+        self.assertEqual(batches, [{"group": "A", "books": 2, "ok": True}])
+
+    def test_apply_interrupted_report_reflects_completed_batches(self):
+        moves = [
+            {"bookId": str(i), "title": f"书{i}", "from": None, "to": "A"} for i in range(41)
+        ] + [{"bookId": "x", "title": "书x", "from": None, "to": "B"}]
+        plan_path = self.dir / "plan.json"
+        plan_path.write_text(
+            json.dumps({"generated_at": datetime.now().isoformat(), "moves": moves}),
+            encoding="utf-8",
+        )
+        fs = FakeShelf({"A": (1, []), "B": (2, [])})
+        calls = []
+        rp = self.dir / "report.json"
+        with (
+            mock.patch.object(W, "get_cred", return_value=CRED),
+            mock.patch.object(W, "sync_shelf", side_effect=lambda *a, **k: fs.shelf()),
+            mock.patch.object(W, "http_json", side_effect=_http_401_on({"B"}, fs, calls)),
+            mock.patch.object(W.time, "sleep"),
+            mock.patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                W.cmd_apply(ns(plan=str(plan_path), dry_run=False, yes=False, json_report=str(rp)))
+        self.assertEqual(cm.exception.code, 2)
+        report = json.loads(rp.read_text(encoding="utf-8"))
+        self.assertTrue(report["interrupted"])
+        self.assertEqual(sorted(report["moved"]), sorted(str(i) for i in range(41)))
+        self.assertEqual(report["failed"], ["x"])
+        self.assertEqual([b["ok"] for b in report["batches"]], [True, True, False])
+        self.assertEqual(report["batches"][-1]["books"], 1)
+
+    def test_review_interrupted_report_reflects_completed_batches(self):
+        decisions = [
+            {"bookId": "1", "group": "A"},
+            {"bookId": "2", "group": "B"},
+            {"bookId": "3", "group": "C"},
+        ]
+        dp = self.dir / "d.json"
+        dp.write_text(json.dumps(decisions), encoding="utf-8")
+        fs = FakeShelf({"A": (1, []), "B": (2, []), "C": (3, [])})
+        calls = []
+        rp = self.dir / "review.json"
+        with (
+            mock.patch.object(W, "get_cred", return_value=CRED),
+            mock.patch.object(W, "sync_shelf", side_effect=lambda *a, **k: fs.shelf()),
+            mock.patch.object(W, "http_json", side_effect=_http_401_on({"B"}, fs, calls)),
+            mock.patch.object(W.time, "sleep"),
+            mock.patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                W.cmd_review(ns(decisions=str(dp), json_report=str(rp), yes=False))
+        self.assertEqual(cm.exception.code, 2)
+        report = json.loads(rp.read_text(encoding="utf-8"))
+        self.assertEqual(report["moved"], ["1"])
+        self.assertEqual(report["failed"], ["2", "3"])
+        self.assertEqual(report["batches"][0], {"group": "A", "books": 1, "ok": True})
+        self.assertEqual([c["name"] for c in calls], ["A", "B"])  # 失效后不再继续发请求
+
+    def test_apply_dry_run_needs_no_credentials(self):
+        plan_path = self.dir / "plan.json"
+        plan_path.write_text(json.dumps({"moves": [{"bookId": "1", "to": "A"}]}), encoding="utf-8")
+        with mock.patch.object(W, "get_cred") as gc, mock.patch.object(W, "http_json") as hj:
+            W.cmd_apply(ns(plan=str(plan_path), dry_run=True, yes=False, json_report=None))
+        gc.assert_not_called()
+        hj.assert_not_called()
+
+
+class CrossPlatformCredTests(unittest.TestCase):
+    """回归: 非 macOS(无 `open`)或网络异常时, get_cred 以 FATAL + 退出码 2 结束, 不抛 traceback。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.empty_log_dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _no_open(self, *a, **k):
+        raise FileNotFoundError(2, "No such file or directory", "open")
+
+    def test_extract_cred_without_open_command_returns_none(self):
+        with (
+            mock.patch.object(W.subprocess, "run", side_effect=self._no_open),
+            mock.patch.object(W, "LOG_DIR", self.empty_log_dir),
+            mock.patch.object(W.time, "sleep") as sl,
+        ):
+            self.assertIsNone(W.extract_cred())
+        sl.assert_not_called()  # 未能启动客户端时不应空等
+
+    def _assert_fatal_exit(self, env, http_side_effect, platform="linux"):
+        err = io.StringIO()
+        with (
+            mock.patch.dict("os.environ", env, clear=False),
+            mock.patch.object(W.subprocess, "run", side_effect=self._no_open),
+            mock.patch.object(W, "LOG_DIR", self.empty_log_dir),
+            mock.patch.object(W, "http_json", side_effect=http_side_effect),
+            mock.patch.object(W.time, "sleep"),
+            mock.patch.object(W.sys, "platform", platform),
+            mock.patch("sys.stderr", err),
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                W.get_cred()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("FATAL", err.getvalue())
+
+    def test_no_env_off_macos_fails_with_fatal(self):
+        with mock.patch.dict("os.environ", {}, clear=False) as env:
+            env.pop("WEREAD_VID", None)
+            env.pop("WEREAD_SKEY", None)
+            self._assert_fatal_exit({}, AssertionError("不应发请求"))
+
+    def test_no_env_on_macos_without_open_still_fatal(self):
+        with mock.patch.dict("os.environ", {}, clear=False) as env:
+            env.pop("WEREAD_VID", None)
+            env.pop("WEREAD_SKEY", None)
+            self._assert_fatal_exit({}, AssertionError("不应发请求"), platform="darwin")
+
+    def test_env_cred_network_error_fails_with_fatal(self):
+        self._assert_fatal_exit(
+            {"WEREAD_VID": "12345678", "WEREAD_SKEY": "abcDEF12"},
+            urllib.error.URLError("Name or service not known"),
+        )
+
+    def test_env_cred_timeout_fails_with_fatal(self):
+        self._assert_fatal_exit(
+            {"WEREAD_VID": "12345678", "WEREAD_SKEY": "abcDEF12"}, TimeoutError("timed out")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
